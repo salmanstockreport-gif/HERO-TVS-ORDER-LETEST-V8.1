@@ -17,6 +17,7 @@ import { toast } from "sonner";
 import api, { API, formatApiError } from "@/lib/api";
 import { IDS } from "@/lib/testIds";
 import { formatPartNo, partNoKey } from "@/lib/partNo";
+import ConfirmDeleteDialog from "@/components/ConfirmDeleteDialog";
 
 const emptyItem = () => ({
   part_no: "",
@@ -51,6 +52,7 @@ export default function OrderEditor() {
   const [previouslyOrdered, setPreviouslyOrdered] = useState(null);
   const [inventoryMap, setInventoryMap] = useState({}); // part_no_norm -> stock
   const [manualOpen, setManualOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const [manualForm, setManualForm] = useState({
     part_no: "",
     description: "",
@@ -320,6 +322,10 @@ export default function OrderEditor() {
 
   const save = async () => {
     if (!order) return;
+    if (items.length === 0) {
+      toast.error("Cannot save an empty order. Add at least one part.");
+      return;
+    }
     setSaving(true);
     try {
       const { data } = await api.put(`/orders/${order.id}`, {
@@ -380,10 +386,16 @@ export default function OrderEditor() {
 
   const deleteOrder = async () => {
     if (!order) return;
-    if (!window.confirm(`Delete order ${order.order_no}?`)) return;
-    await api.delete(`/orders/${order.id}`);
-    toast.success("Deleted");
-    navigate("/orders/current");
+    try {
+      await api.delete(`/orders/${order.id}`, {
+        params: { confirm: "delete" },
+      });
+      toast.success("Deleted");
+      navigate("/orders/current");
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Delete failed");
+      throw e;
+    }
   };
 
   const partNoLookupStock = (pn) => {
@@ -528,8 +540,13 @@ export default function OrderEditor() {
             <button
               data-testid={IDS.editorSaveBtn}
               onClick={save}
-              disabled={saving}
+              disabled={saving || items.length === 0}
+              title={items.length === 0 ? "Add at least one part to save" : ""}
               className="btn btn-outline"
+              style={{
+                opacity: items.length === 0 ? 0.5 : 1,
+                cursor: items.length === 0 ? "not-allowed" : "pointer",
+              }}
             >
               <FloppyDisk size={14} />
               <span>{saving ? "Saving…" : "Save"}</span>
@@ -573,7 +590,7 @@ export default function OrderEditor() {
           )}
           <button
             data-testid={IDS.editorDeleteBtn}
-            onClick={deleteOrder}
+            onClick={() => setDeleteOpen(true)}
             className="btn btn-danger"
           >
             <Trash size={14} />
@@ -1090,6 +1107,14 @@ export default function OrderEditor() {
           placeholder="Optional notes for this order sheet…"
         />
       </div>
+
+      <ConfirmDeleteDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        orderNo={order?.order_no || ""}
+        onConfirm={deleteOrder}
+        testIdPrefix="editor-confirm-delete"
+      />
     </div>
   );
 }

@@ -4,10 +4,12 @@ import { Plus, ArrowRight, Trash } from "@phosphor-icons/react";
 import api from "@/lib/api";
 import { IDS } from "@/lib/testIds";
 import { toast } from "sonner";
+import ConfirmDeleteDialog from "@/components/ConfirmDeleteDialog";
 
 export default function OrdersList({ status }) {
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [pendingDelete, setPendingDelete] = useState(null); // {id, order_no}
   const navigate = useNavigate();
 
   const load = () => {
@@ -20,11 +22,17 @@ export default function OrdersList({ status }) {
 
   useEffect(load, [status]);
 
-  const remove = async (id, orderNo) => {
-    if (!window.confirm(`Delete order ${orderNo}?`)) return;
-    await api.delete(`/orders/${id}`);
-    toast.success("Order deleted");
-    load();
+  const confirmDelete = async () => {
+    if (!pendingDelete) return;
+    try {
+      await api.delete(`/orders/${pendingDelete.id}`, {
+        params: { confirm: "delete" },
+      });
+      toast.success("Order deleted");
+      load();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Delete failed");
+    }
   };
 
   const title = status === "current" ? "Current Orders" : "Sent Orders";
@@ -140,7 +148,7 @@ export default function OrdersList({ status }) {
                         <button
                           className="btn btn-ghost"
                           style={{ padding: "4px 8px", fontSize: "11px", color: "#f87171" }}
-                          onClick={() => remove(o.id, o.order_no)}
+                          onClick={() => setPendingDelete({ id: o.id, order_no: o.order_no })}
                           data-testid={`delete-order-${o.order_no}`}
                         >
                           <Trash size={12} />
@@ -155,6 +163,14 @@ export default function OrdersList({ status }) {
           </div>
         )}
       </div>
+
+      <ConfirmDeleteDialog
+        open={!!pendingDelete}
+        onOpenChange={(v) => !v && setPendingDelete(null)}
+        orderNo={pendingDelete?.order_no || ""}
+        onConfirm={confirmDelete}
+        testIdPrefix="orders-list-confirm-delete"
+      />
     </div>
   );
 }

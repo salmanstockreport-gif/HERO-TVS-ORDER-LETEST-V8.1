@@ -552,6 +552,9 @@ async def update_order(order_id: str, body: OrderUpdate, current_user: dict = De
         compute_item_totals(d, global_discount)
         items.append(d)
 
+    if not items:
+        raise HTTPException(status_code=400, detail="Cannot save an empty order. Add at least one part.")
+
     await db.orders.update_one(
         {"id": order_id},
         {"$set": {"items": items, "remarks": body.remarks, "updated_at": now_iso()}},
@@ -589,7 +592,12 @@ async def reopen_order(order_id: str, current_user: dict = Depends(get_current_u
 
 
 @api_router.delete("/orders/{order_id}")
-async def delete_order(order_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_order(order_id: str, confirm: str = "", current_user: dict = Depends(get_current_user)):
+    if confirm.strip().lower() != "delete":
+        raise HTTPException(
+            status_code=400,
+            detail="Delete not confirmed. Type 'delete' to confirm.",
+        )
     r = await db.orders.delete_one({"id": order_id})
     if r.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Order not found")
