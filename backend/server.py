@@ -13,12 +13,12 @@ from typing import List, Optional, Dict, Any
 import bcrypt
 import jwt
 import requests
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, UploadFile, File, Form
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -463,9 +463,8 @@ async def get_order(order_id: str, current_user: dict = Depends(get_current_user
     return order
 
 
-@api_router.post("/orders")
-async def create_order(body: OrderCreate, current_user: dict = Depends(require_fresh_inventory)):
-    # Enforce concurrent-current-orders limit
+async def _ensure_current_orders_limit() -> None:
+    """Raise 409 if the concurrent-current-orders cap is already hit."""
     current_count = await db.orders.count_documents({"status": "current"})
     if current_count >= MAX_CURRENT_ORDERS:
         raise HTTPException(
@@ -482,27 +481,28 @@ async def create_order(body: OrderCreate, current_user: dict = Depends(require_f
             },
         )
 
-    settings = await db.settings.find_one({"key": "global"}) or {}
-    global_discount = float(settings.get("discount_percent") or 0.0)
+
+async def _resolve_new_order_items(
+    incoming: List[OrderItem], global_discount: float
+) -> List[dict]:
+    """Auto-inject mandatory parts (when toggle is on and incoming is empty),
+    dedupe by normalized part number, and compute per-line totals."""
     mand_toggle = await db.settings.find_one({"key": "mandatory_parts_toggle"}) or {}
     mand_enabled = bool(mand_toggle.get("enabled", False))
 
-    order_no = await generate_order_no()
-    items = []
-    seen = set()
-
-    # Auto-inject mandatory parts when creating a new (empty) order and toggle is on
-    incoming = list(body.items or [])
-    if mand_enabled and len(incoming) == 0:
+    items_in = list(incoming)
+    if mand_enabled and not items_in:
         async for mp in db.mandatory_parts.find({}, {"_id": 0}):
-            incoming.append(OrderItem(
+            items_in.append(OrderItem(
                 part_no=mp.get("part_no", ""),
                 description=mp.get("description", ""),
                 mrp=float(mp.get("mrp") or 0),
                 qty=int(mp.get("qty") or 1),
             ))
 
-    for it in incoming:
+    items: List[dict] = []
+    seen: set = set()
+    for it in items_in:
         d = it.model_dump()
         norm = normalize_part_no(d["part_no"])
         if not norm or norm in seen:
@@ -510,10 +510,20 @@ async def create_order(body: OrderCreate, current_user: dict = Depends(require_f
         seen.add(norm)
         compute_item_totals(d, global_discount)
         items.append(d)
+    return items
+
+
+@api_router.post("/orders")
+async def create_order(body: OrderCreate, current_user: dict = Depends(require_fresh_inventory)) -> dict:
+    await _ensure_current_orders_limit()
+
+    settings = await db.settings.find_one({"key": "global"}) or {}
+    global_discount = float(settings.get("discount_percent") or 0.0)
+    items = await _resolve_new_order_items(body.items or [], global_discount)
 
     order = {
         "id": str(uuid.uuid4()),
-        "order_no": order_no,
+        "order_no": await generate_order_no(),
         "status": "current",
         "items": items,
         "remarks": body.remarks,
@@ -635,27 +645,28 @@ async def check_part_history(part_no: str, exclude_order_id: Optional[str] = Non
 # ---------------------------------------------------------------------------
 # Excel & PDF Export
 # ---------------------------------------------------------------------------
-def build_order_excel(order: dict) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Order"
+_EXCEL_HEADER_FILL = PatternFill("solid", fgColor="E31837")
+_EXCEL_HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+_EXCEL_THIN = Side(border_style="thin", color="333333")
+_EXCEL_BORDER = Border(left=_EXCEL_THIN, right=_EXCEL_THIN, top=_EXCEL_THIN, bottom=_EXCEL_THIN)
+_EXCEL_COL_WIDTHS = [8, 24, 60, 10]
+_EXCEL_ITEM_HEADERS = ["S.No.", "Part No.", "Description", "Qty"]
 
-    thin = Side(border_style="thin", color="333333")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    header_fill = PatternFill("solid", fgColor="E31837")
-    header_font = Font(bold=True, color="FFFFFF", size=11)
 
-    # Insert logo
+def _excel_add_logo(ws) -> None:
+    if not LOGO_PATH.exists():
+        return
     try:
-        if LOGO_PATH.exists():
-            from openpyxl.drawing.image import Image as XLImage
-            img = XLImage(str(LOGO_PATH))
-            img.width = 60
-            img.height = 60
-            ws.add_image(img, "A1")
+        from openpyxl.drawing.image import Image as XLImage
+        img = XLImage(str(LOGO_PATH))
+        img.width = 60
+        img.height = 60
+        ws.add_image(img, "A1")
     except Exception:
         pass
 
+
+def _excel_write_header(ws, order: dict) -> None:
     ws.row_dimensions[1].height = 45
     ws["B1"] = "KABIR AUTO PARTS"
     ws["B1"].font = Font(bold=True, size=18, color="B31229")
@@ -678,17 +689,19 @@ def build_order_excel(order: dict) -> bytes:
     if order.get("remarks"):
         ws["A7"] = f"Remarks: {order['remarks']}"
 
-    header_row = 9
-    headers = ["S.No.", "Part No.", "Description", "Qty"]
-    for i, h in enumerate(headers, start=1):
+
+def _excel_write_items_table(ws, order: dict, header_row: int = 9) -> int:
+    """Write the items table starting at `header_row`. Returns total qty."""
+    for i, h in enumerate(_EXCEL_ITEM_HEADERS, start=1):
         cell = ws.cell(row=header_row, column=i, value=h)
-        cell.fill = header_fill
-        cell.font = header_font
+        cell.fill = _EXCEL_HEADER_FILL
+        cell.font = _EXCEL_HEADER_FONT
         cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border
+        cell.border = _EXCEL_BORDER
 
     total_qty = 0
-    for idx, item in enumerate(order.get("items", []), start=1):
+    items = order.get("items", []) or []
+    for idx, item in enumerate(items, start=1):
         row = header_row + idx
         vals = [
             idx,
@@ -698,21 +711,31 @@ def build_order_excel(order: dict) -> bytes:
         ]
         for i, v in enumerate(vals, start=1):
             cell = ws.cell(row=row, column=i, value=v)
-            cell.border = border
+            cell.border = _EXCEL_BORDER
             if i in (1, 4):
                 cell.alignment = Alignment(horizontal="center")
         total_qty += int(item.get("qty") or 0)
 
-    total_row = header_row + len(order.get("items", [])) + 1
+    total_row = header_row + len(items) + 1
     total_label = ws.cell(row=total_row, column=3, value="TOTAL QTY")
     total_label.font = Font(bold=True)
     total_label.alignment = Alignment(horizontal="right")
     total_qty_cell = ws.cell(row=total_row, column=4, value=total_qty)
     total_qty_cell.font = Font(bold=True)
     total_qty_cell.alignment = Alignment(horizontal="center")
+    return total_qty
 
-    widths = [8, 24, 60, 10]
-    for i, w in enumerate(widths, start=1):
+
+def build_order_excel(order: dict) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Order"
+
+    _excel_add_logo(ws)
+    _excel_write_header(ws, order)
+    _excel_write_items_table(ws, order)
+
+    for i, w in enumerate(_EXCEL_COL_WIDTHS, start=1):
         ws.column_dimensions[chr(64 + i)].width = w
 
     out = io.BytesIO()
@@ -724,18 +747,16 @@ def build_order_excel(order: dict) -> bytes:
 LOGO_PATH = ROOT_DIR / "assets" / "kabir-logo.jpg"
 
 
-def build_order_pdf(order: dict) -> bytes:
-    out = io.BytesIO()
-    doc = SimpleDocTemplate(out, pagesize=landscape(A4), leftMargin=15 * mm, rightMargin=15 * mm, topMargin=12 * mm, bottomMargin=12 * mm)
+def _pdf_styles():
     styles = getSampleStyleSheet()
-    brand_style = ParagraphStyle("brand", parent=styles["Heading1"], textColor=colors.HexColor("#B31229"), fontSize=20, spaceAfter=0)
-    subtitle_style = ParagraphStyle("subtitle", parent=styles["Normal"], textColor=colors.HexColor("#555555"), fontSize=10, spaceAfter=8)
-    meta_style = ParagraphStyle("meta", parent=styles["Normal"], fontSize=9)
+    return {
+        "brand": ParagraphStyle("brand", parent=styles["Heading1"], textColor=colors.HexColor("#B31229"), fontSize=20, spaceAfter=0),
+        "subtitle": ParagraphStyle("subtitle", parent=styles["Normal"], textColor=colors.HexColor("#555555"), fontSize=10, spaceAfter=8),
+        "meta": ParagraphStyle("meta", parent=styles["Normal"], fontSize=9),
+    }
 
-    story = []
 
-    # Header row: logo + brand name
-    header_data = []
+def _pdf_header_row(order: dict, style_map: dict) -> Table:
     logo_cell = ""
     if LOGO_PATH.exists():
         try:
@@ -745,40 +766,32 @@ def build_order_pdf(order: dict) -> bytes:
     brand_para = Paragraph(
         "<b>KABIR AUTO PARTS</b><br/>"
         "<font size=8 color='#666666'>Hero MotoCorp Genuine Parts Dealer</font>",
-        brand_style,
+        style_map["brand"],
     )
     order_meta = Paragraph(
         f"<b>ORDER SHEET</b><br/>"
         f"<font size=10><b>{order['order_no']}</b></font><br/>"
         f"<font size=8 color='#666666'>{order['status'].upper()} · "
         f"{order['created_at'][:10]}</font>",
-        subtitle_style,
+        style_map["subtitle"],
     )
-    header_data = [[logo_cell, brand_para, order_meta]]
-    header_table = Table(header_data, colWidths=[26 * mm, 160 * mm, 80 * mm])
+    header_table = Table(
+        [[logo_cell, brand_para, order_meta]],
+        colWidths=[26 * mm, 160 * mm, 80 * mm],
+    )
     header_table.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("ALIGN", (2, 0), (2, 0), "RIGHT"),
         ("LINEBELOW", (0, 0), (-1, -1), 1.2, colors.HexColor("#E31837")),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
-    story.append(header_table)
-    story.append(Spacer(1, 4 * mm))
+    return header_table
 
-    # Order details
-    meta_text = (
-        f"<b>Created:</b> {order['created_at'][:19].replace('T', ' ')}"
-    )
-    if order.get("sent_at"):
-        meta_text += f"   |   <b>Sent:</b> {order['sent_at'][:19].replace('T', ' ')}"
-    story.append(Paragraph(meta_text, meta_style))
-    if order.get("remarks"):
-        story.append(Paragraph(f"<b>Remarks:</b> {order['remarks']}", meta_style))
-    story.append(Spacer(1, 5 * mm))
 
+def _pdf_items_table(order: dict) -> Table:
     data = [["S.No.", "Part No.", "Description", "Qty"]]
     total_qty = 0
-    for idx, item in enumerate(order.get("items", []), start=1):
+    for idx, item in enumerate(order.get("items", []) or [], start=1):
         data.append([
             str(idx),
             format_part_no_display(item.get("part_no", "")),
@@ -806,15 +819,39 @@ def build_order_pdf(order: dict) -> bytes:
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-    story.append(table)
+    return table
 
-    # Footer
-    story.append(Spacer(1, 6 * mm))
-    footer = Paragraph(
-        "<font size=7 color='#888888'>Generated by Kabir Auto Parts · Hero MotoCorp Parts Ordering System</font>",
-        subtitle_style,
+
+def _pdf_meta_paragraphs(order: dict, meta_style) -> List:
+    meta_text = f"<b>Created:</b> {order['created_at'][:19].replace('T', ' ')}"
+    if order.get("sent_at"):
+        meta_text += f"   |   <b>Sent:</b> {order['sent_at'][:19].replace('T', ' ')}"
+    paras: list = [Paragraph(meta_text, meta_style)]
+    if order.get("remarks"):
+        paras.append(Paragraph(f"<b>Remarks:</b> {order['remarks']}", meta_style))
+    return paras
+
+
+def build_order_pdf(order: dict) -> bytes:
+    out = io.BytesIO()
+    doc = SimpleDocTemplate(
+        out, pagesize=landscape(A4),
+        leftMargin=15 * mm, rightMargin=15 * mm,
+        topMargin=12 * mm, bottomMargin=12 * mm,
     )
-    story.append(footer)
+    style_map = _pdf_styles()
+
+    story: list = []
+    story.append(_pdf_header_row(order, style_map))
+    story.append(Spacer(1, 4 * mm))
+    story.extend(_pdf_meta_paragraphs(order, style_map["meta"]))
+    story.append(Spacer(1, 5 * mm))
+    story.append(_pdf_items_table(order))
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph(
+        "<font size=7 color='#888888'>Generated by Kabir Auto Parts · Hero MotoCorp Parts Ordering System</font>",
+        style_map["subtitle"],
+    ))
 
     doc.build(story)
     out.seek(0)
@@ -889,6 +926,38 @@ async def inventory_preview(file: UploadFile = File(...), current_user: dict = D
     return {"columns": columns, "sample": sample, "row_count": int(len(df))}
 
 
+def _parse_inventory_rows(df, mapping: dict) -> List[dict]:
+    """Turn a DataFrame + column mapping into inventory documents ready to insert."""
+    part_no_col = mapping["part_no"]
+    stock_qty_col = mapping["stock_qty"]
+    desc_col = mapping.get("description") or ""
+    loc_col = mapping.get("location") or ""
+    rate_col = mapping.get("rate") or ""
+
+    ts = now_iso()
+    rows: List[dict] = []
+    for _, r in df.iterrows():
+        raw_pn = r.get(part_no_col, "")
+        if pd.isna(raw_pn) or str(raw_pn).strip() == "":
+            continue
+        try:
+            qty_val = r.get(stock_qty_col, 0)
+            qty_num = float(qty_val) if not pd.isna(qty_val) else 0.0
+        except Exception:
+            qty_num = 0.0
+        rows.append({
+            "id": str(uuid.uuid4()),
+            "part_no": str(raw_pn).strip(),
+            "part_no_norm": normalize_part_no(str(raw_pn)),
+            "description": str(r.get(desc_col, "")).strip() if desc_col else "",
+            "stock_qty": qty_num,
+            "location": str(r.get(loc_col, "")).strip() if loc_col else "",
+            "rate": str(r.get(rate_col, "")).strip() if rate_col else "",
+            "uploaded_at": ts,
+        })
+    return rows
+
+
 @api_router.post("/inventory/upload")
 async def inventory_upload(
     file: UploadFile = File(...),
@@ -899,53 +968,32 @@ async def inventory_upload(
     rate: str = Form(""),
     replace: bool = Form(True),
     current_user: dict = Depends(get_current_user),
-):
+) -> dict:
     content = await file.read()
     df = read_upload_to_df(file, content)
 
     if part_no not in df.columns or stock_qty not in df.columns:
         raise HTTPException(status_code=400, detail="Mapped columns not found in file")
 
+    mapping = {
+        "part_no": part_no,
+        "description": description,
+        "stock_qty": stock_qty,
+        "location": location,
+        "rate": rate,
+    }
+
     # save mapping
     await db.settings.update_one(
         {"key": "inventory_mapping"},
-        {"$set": {
-            "key": "inventory_mapping",
-            "part_no": part_no,
-            "description": description,
-            "stock_qty": stock_qty,
-            "location": location,
-            "rate": rate,
-            "updated_at": now_iso(),
-        }},
+        {"$set": {**mapping, "key": "inventory_mapping", "updated_at": now_iso()}},
         upsert=True,
     )
 
     if replace:
         await db.inventory.delete_many({})
 
-    rows = []
-    for _, r in df.iterrows():
-        raw_pn = r.get(part_no, "")
-        if pd.isna(raw_pn) or str(raw_pn).strip() == "":
-            continue
-        try:
-            qty_val = r.get(stock_qty, 0)
-            qty_num = float(qty_val) if not pd.isna(qty_val) else 0.0
-        except Exception:
-            qty_num = 0.0
-        doc = {
-            "id": str(uuid.uuid4()),
-            "part_no": str(raw_pn).strip(),
-            "part_no_norm": normalize_part_no(str(raw_pn)),
-            "description": str(r.get(description, "")).strip() if description else "",
-            "stock_qty": qty_num,
-            "location": str(r.get(location, "")).strip() if location else "",
-            "rate": str(r.get(rate, "")).strip() if rate else "",
-            "uploaded_at": now_iso(),
-        }
-        rows.append(doc)
-
+    rows = _parse_inventory_rows(df, mapping)
     if rows:
         await db.inventory.insert_many(rows)
 
@@ -1190,16 +1238,8 @@ async def export_database(current_user: dict = Depends(get_current_user)):
     )
 
 
-@api_router.post("/db/import")
-async def import_database(
-    file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user),
-):
-    """Restore the database from a previously-exported JSON file. Wipes existing
-    data in the affected collections and re-inserts the file's contents."""
+def _parse_backup_payload(raw: bytes) -> dict:
     import json as _json
-
-    raw = await file.read()
     try:
         data = _json.loads(raw.decode("utf-8"))
     except Exception as exc:  # noqa: BLE001
@@ -1210,35 +1250,53 @@ async def import_database(
             status_code=400,
             detail="Not a Hero Parts Ordering backup file.",
         )
-
-    collections = data.get("collections") or {}
-    if not isinstance(collections, dict):
+    if not isinstance(data.get("collections"), dict):
         raise HTTPException(status_code=400, detail="Missing 'collections' object in backup.")
+    return data
 
-    imported = {}
-    for name in BACKUP_COLLECTIONS:
-        if name not in collections:
-            continue
-        docs = collections.get(name) or []
-        if not isinstance(docs, list):
-            raise HTTPException(status_code=400, detail=f"Collection '{name}' must be an array.")
-        # Drop then insert. Drop is idempotent and also removes indexes; recreate them below.
-        await db[name].drop()
-        if docs:
-            # Strip any Mongo _id from source to avoid conflicts
-            for d in docs:
-                if isinstance(d, dict):
-                    d.pop("_id", None)
-            await db[name].insert_many(docs)
-        imported[name] = len(docs)
 
-    # Recreate indexes (mirrors on_startup)
+async def _replace_collection_from_backup(name: str, docs: list) -> None:
+    if not isinstance(docs, list):
+        raise HTTPException(status_code=400, detail=f"Collection '{name}' must be an array.")
+    await db[name].drop()
+    if docs:
+        # Strip any Mongo _id from source to avoid conflicts
+        for d in docs:
+            if isinstance(d, dict):
+                d.pop("_id", None)
+        await db[name].insert_many(docs)
+
+
+async def _recreate_core_indexes() -> None:
+    """Mirror index creation done in on_startup (called after import overwrites)."""
     await db.users.create_index("username", unique=True)
     await db.orders.create_index("order_no", unique=True)
     await db.orders.create_index("status")
     await db.inventory.create_index("part_no_norm")
     await db.important_parts.create_index("part_no_norm", unique=True)
     await db.mandatory_parts.create_index("part_no_norm", unique=True)
+
+
+@api_router.post("/db/import")
+async def import_database(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Restore the database from a previously-exported JSON file. Wipes existing
+    data in the affected collections and re-inserts the file's contents."""
+    raw = await file.read()
+    data = _parse_backup_payload(raw)
+    collections = data["collections"]
+
+    imported: dict = {}
+    for name in BACKUP_COLLECTIONS:
+        if name not in collections:
+            continue
+        docs = collections.get(name) or []
+        await _replace_collection_from_backup(name, docs)
+        imported[name] = len(docs)
+
+    await _recreate_core_indexes()
 
     return {
         "success": True,

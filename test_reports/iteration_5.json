@@ -1,0 +1,35 @@
+{
+  "summary": "Backend regression testing after behavior-preserving refactor of server.py helpers. Added targeted test_refactor_regression.py (14 tests) + reran prior test_hero_search.py and test_delete_and_empty_save.py. All 21 refactor-relevant tests PASS when run serially (`-n 0`). Under the repo's default parallel config (`-n 2 --dist loadscope`) 4 tests failed due to CROSS-MODULE test-isolation races on shared 'current orders' cleanup between test_refactor_regression.py and test_delete_and_empty_save.py — NOT caused by the refactor. Refactor is verified behavior-preserving.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "N/A (test infra)", "issue": "test_delete_and_empty_save.py and test_refactor_regression.py both call a `_cleanup_current_orders` helper that deletes ALL current orders on the shared backend. When pytest-xdist runs them on separate workers concurrently, one worker's cleanup wipes the other's just-created order → sporadic 404s on subsequent GET/DELETE. Passes 100% serially. Consider unique remarks-scoped cleanup or module-serial marker."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_refactor_regression.py",
+    "/app/backend/tests/test_hero_search.py",
+    "/app/backend/tests/test_delete_and_empty_save.py",
+    "/app/test_reports/pytest/iteration_5.xml"
+  ],
+  "action_items": [
+    "No refactor regressions found — behavior preserved.",
+    "(Optional) Harden cross-module test isolation: scope `_cleanup_current_orders` to only delete orders whose remarks start with the current module's prefix, so parallel xdist workers don't clobber each other."
+  ],
+  "critical_code_review_comments": [
+    "Refactor is clean: helper extraction in create_order/build_order_excel/build_order_pdf/inventory_upload/import_database is behavior-preserving.",
+    "server.py is now 1358 lines — still exceeds the >700 lines guideline. Consider splitting into modules (routers/orders.py, routers/inventory.py, services/exports.py, services/backup.py) in a follow-up.",
+    "Confirmed: reviewer's suggested `is` → `==` change was a false positive; all `is`/`is not` usages in server.py are `is None`/`is not None` (correct idiom)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_refactor_regression.py (new)"
+  ],
+  "success_rate": {"backend": "100% (21/21 serial)", "frontend": "not tested (backend-only request)"},
+  "test_credentials": "admin / admin123 (from /app/memory/test_credentials.md)",
+  "seed_data_creation": "Ephemeral only: TEST_-prefixed orders, one mandatory part MAND-RF, and a small inventory (23121-KST-901, PISTON-1, AB-1, AB-2). All cleaned up in fixtures; final teardown reuploads fresh inventory so downstream suites/UI remain unblocked by the 24h freshness gate.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Repo's pytest.ini enforces `-n 2 --dist loadscope`. When running BOTH test_refactor_regression.py and test_delete_and_empty_save.py together, use `-n 0` to avoid cross-module cleanup races on the shared 'current orders' pool (MAX 2). Individually or in isolation, they pass under parallel too. New tests specifically cover: MAX_CURRENT_ORDERS=2→409, order_no HMC-YYYYMMDD-NNN regex, global_discount snapshot, dedupe on create, mandatory auto-inject, excel/pdf byte signatures, inventory freshness marker, /api/db/import invalid+valid shapes.",
+  "rca of the issue": "N/A — no functional bugs. The 4 xdist failures reproduce only under parallel loadscope and disappear under `-n 0`, confirming test-isolation (not source) issue: both cleanup helpers indiscriminately delete every 'current' order because MAX_CURRENT_ORDERS=2 forces cleanup to make room, and workers race."
+}
