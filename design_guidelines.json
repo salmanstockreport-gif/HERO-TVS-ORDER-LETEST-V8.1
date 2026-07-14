@@ -1,0 +1,94 @@
+{
+  "theme_strategy": {
+    "default": "dark",
+    "archetype": "THE PERFORMANCE PRO",
+    "rationale": "High-visibility, tactical look for a fast-paced B2B parts dealership. Avoids eye strain for long data-entry sessions."
+  },
+  "colors": {
+    "base_anchor": "#0A0A0A",
+    "surface": "#141414",
+    "border": "#2A2A2A",
+    "primary": "#E31837",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#A1A1AA",
+    "warning": "#F59E0B",
+    "success": "#10B981"
+  },
+  "typography": {
+    "font_pairings": {
+      "headings": "Chivo",
+      "body": "IBM Plex Sans",
+      "mono": "IBM Plex Mono"
+    },
+    "rules": [
+      "Use IBM Plex Mono for all part numbers, quantities, prices, and tabular data to ensure perfect vertical alignment.",
+      "Headings must use tight letter spacing (tracking-tight).",
+      "Overlines/Labels MUST be Uppercase + Tiny + Wide Spacing (tracking-[0.2em]).",
+      "Do not use generic fonts like Inter for headings."
+    ]
+  },
+  "visual enhancers": {
+    "surfaces": "Grid Borders (The 'Technical' Look): Expose the skeleton. border-collapse with border-r border-b border-border/40. Flat solid backgrounds for data clarity.",
+    "textures": "Subtle noise overlay on the main background to break absolute digital flatness.",
+    "shadows": "Tactical Minimalism. Replace soft shadows with 1px solid strokes or 2px 'Inner Glow' highlights."
+  },
+  "grids": {
+    "dashboard": "High Density Grid: grid-cols-1 md:grid-cols-3 lg:grid-cols-4 with gap-4 or gap-6. Every pixel utilized. Summary col-span-1, Feed/List col-span-1 row-span-2."
+  },
+  "layouts": {
+    "table": "Dense tabular layout, 40px condensed row height. Sticky headers and fixed identifier columns (Part Number). Right-align numeric columns.",
+    "spacing": "Generous Spacing Philosophy for macro layouts (p-8 to p-12), but dense spacing within data tables (p-2, p-3) for scanability."
+  },
+  "components": {
+    "tables": "Shadcn based but stripped of excessive padding. Sticky headers, Zebra striping (bg-white/5 alternating), and row-level action menus.",
+    "cards": "Flat background, 1px subtle border (border-border), no shadow. Hover: Slight lift (-translate-y-1), border color darkens.",
+    "inputs": "Shadcn inputs heavily customized. Flat solid surfaces. Use Sonner for toasts."
+  },
+  "motion": {
+    "interactions": "Hover states must explicitly set text color (e.g., hover:bg-slate-900 hover:text-white). Focus states must have HIGHER contrast.",
+    "transitions": "Use specific properties (transition: transform 0.2s ease, opacity 0.2s ease). NO transition: all."
+  },
+  "accessibility": {
+    "contrast": "Text below 18px: 4.5:1. Active/Hover states must have higher contrast. Never use completely transparent backgrounds for overlays or headers.",
+    "testing": "All interactive and key informational elements MUST include a `data-testid` attribute (e.g., data-testid='order-submit-button')."
+  },
+  "media": {
+    "image_urls": [
+      {
+        "url": "https://images.unsplash.com/photo-1596466588448-6e6ceb1da41c?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NjZ8MHwxfHNlYXJjaHwxfHxtb3RvcmN5Y2xlJTIwZW5naW5lJTIwcGFydHMlMjBtYWNybyUyMHBob3RvZ3JhcGh5fGVufDB8fHx8MTc4MzkzMzYwOHww&ixlib=rb-4.1.0&q=85",
+        "description": "Macro shot of motorcycle engine parts. Use as a subtle, low-opacity background imagery for the login screen.",
+        "category": "backgrounds"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1674252281682-2eec258cfa30?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1OTV8MHwxfHNlYXJjaHwxfHxtb2Rlcm4lMjBpbmR1c3RyaWFsJTIwd2FyZWhvdXNlJTIwaW50ZXJpb3J8ZW58MHx8fHwxNzgzOTMzNjA5fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Modern industrial warehouse interior. Use for inventory upload section headers or empty states.",
+        "category": "headers"
+      }
+    ]
+  },
+  "3d libraries": {
+    "recommendation": "Not required. Focus on pure 2D performance and clarity for dense data tables."
+  },
+  "instructions_to_main_agent": [
+    "Build standard React (.js/.jsx) with Tailwind and Shadcn UI primitives. DO NOT use TypeScript (.tsx).",
+    "Use Phosphor Icons (`yarn add @phosphor-icons/react`) for dense developer tools look.",
+    "Implement the 'Grid Borders' look for tables: Expose the skeleton, make the grid visible.",
+    "Data inputs must have warnings for duplicates and previously ordered items. Use `data-testid` on all interactive elements.",
+    "Ensure the Landed Price is auto-calculated visually upon entering the global discount.",
+    "Include 'Current' and 'Sent' tabs for order management.",
+    "For the table: sticky headers, right-align numeric data (prices, quantities), left-align text data (part numbers, descriptions).",
+    "Never use fully transparent backgrounds for dropdowns, modals, or fixed headers.",
+    "Use `sonner` for all toast notifications.",
+    "Create a clean mapping UI for inventory upload to match Excel fields."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "Dark colors look good when used independently without gradients. DO NOT use dark colors as gradients.",
+    "Don't make generic centered layouts, simplistic gradients, and uniform styling.",
+    "Create depth through layered design elements with z-index hierarchy.",
+    "You MUST NOT apply universal transition (e.g., transition: all).",
+    "You MUST NOT center align the app container (.App { text-align: center; }).",
+    "Every interaction needs micro-animations - hover states, transitions.",
+    "Use 2-3x more spacing than feels comfortable for macro layouts.",
+    "NEVER use placeholder URLs or AI assistant Emojis for icons."
+  ]
+}

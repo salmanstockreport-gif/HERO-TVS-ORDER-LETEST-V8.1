@@ -1,0 +1,49 @@
+{
+  "summary": "Backend test suite for Hero MotoCorp Parts Ordering System: 24 tests covering auth, settings, live Hero eCatalogue search, orders lifecycle (create/update/mark-sent/reopen/immutability/duplicate prevention/part history), Excel & PDF exports, inventory (mapping/preview/upload/lookup with normalization) and dashboard stats. 23/24 passed. 1 real business-logic bug found: global discount is NOT applied when items are sent without discount_percent. Live Hero eCatalogue search worked and returned the expected part.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "PUT /api/orders/{id}",
+        "issue": "Global discount is not applied per-line when the client omits discount_percent. OrderItem.discount_percent defaults to 0.0 (Pydantic), and compute_item_totals() checks `if item.get('discount_percent') not in (None, '')` which treats 0.0 as an explicit value. Result: landed_price = MRP (0% discount) instead of MRP*(1 - global/100). Verified with MRP=279.13, global=25%: landed_price came back 279.13 instead of 209.35.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Fix landed-price bug: change OrderItem.discount_percent default from 0.0 to Optional[float] = None, and treat None as 'use global'. Alternatively, in compute_item_totals, use `d = item.get('discount_percent'); disc = float(global_discount if d is None else d)`. Currently the 'defaults to global if not overridden per line' spec is broken."
+  ],
+  "critical_code_review_comments": [
+    "server.py compute_item_totals treats 0.0 as explicit override; combined with OrderItem discount_percent default 0.0 this silently zeros the discount for any client that omits the field. Change model default to None (Optional[float]).",
+    "OrderCreate ignores duplicate part numbers silently (`continue`) while OrderUpdate raises 400. Inconsistent contract; consider raising 400 on create too for feedback parity.",
+    "HeroClient is a module-level singleton with a shared authToken but is not thread/coroutine-safe. Concurrent /api/hero/search requests could race during token refresh. Consider an asyncio.Lock or per-request retry.",
+    "requests library used synchronously inside async endpoints (hero_client.search_part) will block the event loop for up to 25s. Should use httpx.AsyncClient or run in threadpool.",
+    "server.py is ~800 LOC in one file - consider splitting into routers (auth, orders, inventory, hero, dashboard) for maintainability.",
+    "No pagination on GET /api/orders (hard-coded limit 1000) or /api/inventory (limit 500). At scale this will silently truncate results.",
+    "check-part endpoint scans all orders in memory per request - fine for MVP but should use an aggregation with `items.part_no` normalized index for performance.",
+    "urllib3 InsecureRequestWarning is disabled and Hero API called with verify=False. Acceptable for now (self-signed cert) but should be documented.",
+    "CORS allow_origins uses '*' with allow_credentials=True which browsers reject; not an issue for token-in-header auth but should be tightened for production."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py"
+  ],
+  "success_rate": {
+    "backend": "95.8% (23/24)",
+    "frontend": "not tested (backend-only per request)"
+  },
+  "test_credentials": "admin / admin123 (seeded on startup; confirmed working)",
+  "seed_data_creation": "Tests create draft orders with remarks prefixed 'TEST_' (session teardown deletes them). Inventory table is replaced with 3 seed rows (23121-KST-901, AB123, XY-9) via /api/inventory/upload. Global discount is left at 25%.",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "After main agent fixes the discount_default bug in server.py (OrderItem.discount_percent -> Optional[float]=None and compute_item_totals uses global when None), rerun `pytest /app/backend/tests/backend_test.py -v`. Expected: all 24 pass. Hero eCatalogue live search was reachable at time of testing; if it's down, TestHeroSearch::test_hero_search_live will be skipped (502) automatically.",
+  "rca of the issue": "Root cause: /app/backend/server.py line 163 sets `discount_percent: float = 0.0` on OrderItem, and line 216 computes `disc = float(item.get('discount_percent') if item.get('discount_percent') not in (None, '') else global_discount)`. Because Pydantic materializes the field to 0.0 whenever the client omits it, the ternary always chooses the item value (0.0) and never falls back to the global discount. Reproduction: PUT /api/orders/{id} with body {items:[{part_no:'X',mrp:279.13,qty:2}]}; response has discount_percent=0, landed_price=279.13. Fix: make the field Optional[float]=None, or change the fallback to `disc = global_discount if item.get('discount_percent') in (None, '') else float(item['discount_percent'])`."
+}

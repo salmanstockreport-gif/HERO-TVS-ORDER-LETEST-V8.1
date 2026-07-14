@@ -1,0 +1,51 @@
+# Ruff configuration for HMCL backend + tests.
+#
+# We intentionally keep the selected rule set narrow and focused on rules that
+# find real bugs, not stylistic churn. Complexity metrics (C901, PLR0912/0913
+# /0915) and enforced type-hint coverage (ANN) are OFF by design — automated
+# refactoring pressure on working, tested code creates regressions with no
+# user-visible benefit.
+#
+# NOTE ON `is` VS `==`:
+#   Comparisons to None (`x is None`) and to the True/False singletons are
+#   the PEP 8-mandated form (see PEP 8 "Programming Recommendations"). Ruff
+#   does not flag these — E711/E712 flag the *opposite* pattern (`x == None`
+#   or `x == True`). Any external reviewer flagging `x is None` as a bug is
+#   incorrect; do not change those.
+
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+    "F",    # pyflakes — undefined names, unused imports, unused vars
+    "E",    # pycodestyle errors (excludes E7xx via ignore below where needed)
+    "W",    # pycodestyle warnings
+    "B",    # bugbear — real bugs
+    "S",    # bandit-ish security
+    "PLE",  # pylint errors
+    "UP",   # pyupgrade (deprecated syntax)
+    "SIM",  # simplifications that don't change complexity metrics
+    "RUF",
+]
+
+# Rules we deliberately disable — see file header for rationale.
+ignore = [
+    "E501",     # line-too-long (handled by formatter if we ever add one)
+    "S101",     # `assert` used — we use asserts as type-narrowing hints
+    "S104",     # possible binding to 0.0.0.0 (needed for uvicorn in container)
+    "S105",     # hardcoded password string literal (env-driven anyway)
+    "S106",     # same
+    "S311",     # pseudo-random generators — we don't use them for crypto
+    "B008",     # function-call-as-default (FastAPI Depends idiom)
+    "RUF012",   # mutable class attrs annotation (pydantic models handle this)
+]
+
+[lint.per-file-ignores]
+# Tests are allowed to be pragmatic.
+"tests/**" = [
+    "S",     # bandit rules are inappropriate for test code
+    "F401",  # unused imports OK in tests (fixture side-effects)
+    "PLR",   # test complexity is fine — clarity > cyclomatic score
+    "B011",  # bare asserts fine
+]

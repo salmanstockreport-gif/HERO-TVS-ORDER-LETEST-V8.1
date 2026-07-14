@@ -1,0 +1,46 @@
+{
+  "summary": "Tested the 3 new features (Inventory 24h lock, Important Parts, Mandatory Parts) plus regression of previously-working suite. Wrote 12 new backend tests in test_new_features.py — ALL 12 PASS. Regression suite (24 tests) also PASSES (24/24) after fixing a stale hardcoded fallback URL in backend_test.py. Full UI smoke test with Playwright: login → dashboard → lock overlay (after simulating stale via mongo delete) → hides on /inventory → CSV upload unlocks → green freshness badge → Important Parts CRUD + LOW status → dashboard low-stock card populated → mandatory parts page & toggle render. All new data-testids match spec.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/new_features.xml",
+    "/app/test_reports/pytest/regression.xml"
+  ],
+  "action_items": [
+    "Consider persisting POST-upload freshness badge update immediately (currently relies on 60s poll or navigation to refresh useInventoryStatus). Not a bug — the overlay does hide on route change because status is polled — but the sidebar badge may briefly show stale text between upload success and next poll. Optional UX polish: after successful inventory upload, dispatch a manual refresh via useInventoryStatus.refresh().",
+    "Optional: consolidate route conflict-avoidance by co-locating docs — /api/mandatory-toggle (not /api/mandatory-parts/toggle) is correct but easy to miss; adding a short comment on the router file is a nice-to-have."
+  ],
+  "critical_code_review_comments": [
+    "server.py — require_fresh_inventory() dependency correctly blocks POST /orders, PUT /orders/{id}, mark-sent, and /hero/search; GETs are correctly NOT blocked (verified). 423 response body shape matches spec (code, message, fresh, last_uploaded_at, expires_at, hours_remaining, ttl_hours, never_uploaded).",
+    "server.py — auto-inject uses OrderItem(...) then compute_item_totals with global_discount — correctly applies 25% discount to injected mandatory parts (verified: MRP 400 → landed 300, line 900 at 25%).",
+    "server.py — /mandatory-toggle uses PUT /api/mandatory-toggle as spec'd (avoids conflict with PUT /mandatory-parts/{id}).",
+    "server.py — file is now 1171 LOC (~370 lines added). It is time to split into routers (auth, orders, inventory, important, mandatory, dashboard) — flagged in previous iteration and still relevant.",
+    "server.py — HeroClient uses synchronous requests inside async endpoints; still blocking the event loop for up to 25s per Hero call (from prior iteration, not fixed).",
+    "server.py — startup handler seeds admin on empty users; admin_username lower-cased; good. However on_startup uses @app.on_event which is deprecated in FastAPI >=0.109 — should migrate to lifespan handler.",
+    "InventoryLockOverlay uses `location.pathname.startsWith('/inventory')` — correctly bypasses the overlay only for that route.",
+    "useInventoryStatus polls every 60s + listens for 423 broadcast — works but there is no explicit refresh trigger fired after a successful upload from Inventory.js; the sidebar badge may lag until next poll (minor UX)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_new_features.py (new)",
+    "/app/backend/tests/backend_test.py (fixed stale BASE_URL fallback)"
+  ],
+  "success_rate": {
+    "backend": "100% (36/36 — 24 regression + 12 new)",
+    "frontend": "100% smoke pass — all new pages, testids, overlay, badge and lock/unlock flow verified"
+  },
+  "test_credentials": "admin / admin123 (already seeded)",
+  "seed_data_creation": "Test file uploads a small 3-row inventory (23121-KST-901, PISTON-1, BOLT-9) via /api/inventory/upload. Fixture ensures inventory is refreshed at end of module so subsequent tests / UI stays unlocked. TEST_/UITEST-prefixed important & mandatory parts + orders created and cleaned up.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend test suite is now 36 tests: /app/backend/tests/backend_test.py (24 regression) and /app/backend/tests/test_new_features.py (12 new-feature). Both pass with `pytest -n 0` (pytest.ini forces -n 2 --dist loadscope by default which also works). Local mongo access via MONGO_URL/DB_NAME env is used by TestInventoryLock to simulate stale state — pymongo dep added. To test lock overlay in UI manually: `mongosh mongodb://localhost:27017/hmcl_db --eval 'db.settings.deleteOne({key:\"inventory_status\"})'` then reload the app. To restore, upload any CSV/XLSX via /inventory.",
+  "rca of the issue": "No blocking issues found. Only minor UX polish item noted (freshness badge lag)."
+}
