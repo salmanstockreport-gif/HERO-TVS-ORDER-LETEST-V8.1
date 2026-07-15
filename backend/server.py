@@ -1329,11 +1329,16 @@ async def list_important_parts(
 ):
     require_system_access(current_user, system)
     docs = await db.important_parts.find({"system": system}, {"_id": 0}).sort("created_at", -1).to_list(500)
-    # enrich with current stock
+    # Batch-load inventory for all these parts to avoid N+1
+    norms = [d.get("part_no_norm") for d in docs if d.get("part_no_norm")]
+    inv_map: Dict[str, dict] = {}
+    if norms:
+        async for inv in db.inventory.find(
+            {"part_no_norm": {"$in": norms}}, {"_id": 0, "part_no_norm": 1, "stock_qty": 1}
+        ):
+            inv_map[inv["part_no_norm"]] = inv
     for d in docs:
-        inv = await db.inventory.find_one(
-            {"part_no_norm": d.get("part_no_norm")}, {"_id": 0, "stock_qty": 1}
-        )
+        inv = inv_map.get(d.get("part_no_norm"))
         d["current_stock"] = float(inv["stock_qty"]) if inv else 0.0
         d["is_low"] = d["current_stock"] < float(d.get("threshold_qty") or 0)
     return docs
@@ -1502,17 +1507,31 @@ async def dashboard_stats(system: str = "hero", current_user: dict = Depends(get
     current = await db.orders.count_documents({"status": "current", "system": system})
     sent = await db.orders.count_documents({"status": "sent", "system": system})
     inventory_count = await db.inventory.count_documents({})
-    total_sent_value = 0.0
-    async for o in db.orders.find({"status": "sent", "system": system}, {"items": 1, "_id": 0}):
-        for it in o.get("items", []):
-            total_sent_value += float(it.get("line_total") or 0)
 
-    # low-stock alerts on important parts (this system only)
+    # Sum total sent value in one aggregation instead of Python loop.
+    total_sent_value = 0.0
+    pipeline = [
+        {"$match": {"status": "sent", "system": system}},
+        {"$unwind": "$items"},
+        {"$group": {"_id": None, "total": {"$sum": "$items.line_total"}}},
+    ]
+    agg = await db.orders.aggregate(pipeline).to_list(1)
+    if agg:
+        total_sent_value = float(agg[0].get("total") or 0.0)
+
+    # low-stock alerts on important parts (this system only) - batch-load inventory
+    important = await db.important_parts.find({"system": system}, {"_id": 0}).to_list(500)
+    norms = [ip.get("part_no_norm") for ip in important if ip.get("part_no_norm")]
+    inv_map: Dict[str, dict] = {}
+    if norms:
+        async for inv in db.inventory.find(
+            {"part_no_norm": {"$in": norms}}, {"_id": 0, "part_no_norm": 1, "stock_qty": 1}
+        ):
+            inv_map[inv["part_no_norm"]] = inv
+
     low_stock_alerts = []
-    async for ip in db.important_parts.find({"system": system}, {"_id": 0}):
-        inv = await db.inventory.find_one(
-            {"part_no_norm": ip.get("part_no_norm")}, {"_id": 0, "stock_qty": 1}
-        )
+    for ip in important:
+        inv = inv_map.get(ip.get("part_no_norm"))
         current_stock = float(inv["stock_qty"]) if inv else 0.0
         threshold = float(ip.get("threshold_qty") or 0)
         if current_stock < threshold:
