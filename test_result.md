@@ -116,6 +116,21 @@ user_problem_statement: |
      - Returns part_no, description, MRP from top result.
 
 backend:
+  - task: "Hero eCatalogue URL migration (bug fix)"
+    implemented: true
+    working: true
+    file: "backend/.env, RAILWAY_DEPLOY.md"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Bug: Hero search was failing because ecatalogue.heromotocorp.com no longer resolves (Hero decommissioned that host; users saw a Cloudflare origin-unreachable error). Updated HERO_ECATALOGUE_URL to the current endpoint https://ecatalogue.heromotocorp.biz:8080/HeroeCat/ discovered from Hero's own dealer web UI at /Hero/js/web.js. Verified via curl: getGeneralUserDetails returns 200 with authToken and partSearch for 23121KST901 returns MRP 279.13 with description 'GEAR , PRIMARY DRIVE (18T)'. Locally /api/hero/search?q=23121KST901 now returns a populated parts array."
+        - working: true
+          agent: "testing"
+          comment: "✅ VERIFIED - Hero eCatalogue URL migration bug fix is WORKING. All 6 tests passed (100%). Test results: (1) Login successful with admin/admin123, obtained access token. (2) Inventory is fresh (uploaded 2026-07-15T17:56:39). (3) Hero search for 23121KST901 returned HTTP 200 with part_no='23121KST901S', description='GEAR , PRIMARY DRIVE (18T)', mrp=279.13, image_url='https://ecatalogue.heromotocorp.biz/sol_dealer/dealer/ecat_print/part_image/23121-KST-901.jpg' - all expected values match. (4) Hero search for 23100KRE900 returned HTTP 200 with empty parts array (part doesn't exist in catalogue) - no 502 ConnectionError. (5) TVS search for N3012050 still working correctly (no regression), returned correct data. (6) Backend logs show NO new errors after restart - no 'Name or service not known', 'Failed to resolve', or 'ecatalogue.heromotocorp.com' errors since the fix was applied. The old URL errors in logs are from before the restart. Current Hero searches are successfully using the new URL https://ecatalogue.heromotocorp.biz:8080/HeroeCat/ and returning correct data."
+
   - task: "TVS eCatalogue integration (GET /api/tvs/search)"
     implemented: true
     working: true
@@ -306,4 +321,30 @@ agent_communication:
         - Inventory freshness gate working correctly
         - Legacy compatibility maintained
         
+    - agent: "testing"
+      message: |
+        ✅ HERO ECATALOGUE URL MIGRATION BUG FIX VERIFIED - ALL TESTS PASSED (6/6 - 100%)
+        
+        Bug fix verification completed successfully. The Hero eCatalogue integration is now fully working after the URL migration from ecatalogue.heromotocorp.com to ecatalogue.heromotocorp.biz:8080/HeroeCat/.
+        
+        Test Results:
+        1. ✅ Login - Successfully authenticated with admin/admin123, obtained access token
+        2. ✅ Inventory Freshness - Inventory is fresh (last uploaded 2026-07-15T17:56:39, 23.71 hours remaining)
+        3. ✅ Hero Search Primary (23121KST901) - HTTP 200, returned correct part:
+           - part_no: '23121KST901S' ✓
+           - description: 'GEAR , PRIMARY DRIVE (18T)' ✓ (contains "GEAR" and "PRIMARY DRIVE")
+           - mrp: 279.13 ✓ (> 0, expected ~279.13)
+           - image_url: 'https://ecatalogue.heromotocorp.biz/sol_dealer/dealer/ecat_print/part_image/23121-KST-901.jpg' ✓ (starts with new domain)
+        4. ✅ Hero Search Secondary (23100KRE900) - HTTP 200, empty parts array (part doesn't exist in catalogue), NO 502 ConnectionError
+        5. ✅ TVS Search No Regression (N3012050) - HTTP 200, returned correct data (description='VALVE STEM OIL SEAL', mrp=80.0)
+        6. ✅ Backend Logs Check - NO new errors after restart. No 'Name or service not known', 'Failed to resolve', or 'ecatalogue.heromotocorp.com' errors since the fix was applied.
+        
+        Key Evidence:
+        - Hero searches are returning HTTP 200 (not 502)
+        - Image URLs now use the new domain: https://ecatalogue.heromotocorp.biz
+        - No new DNS resolution errors in backend logs since restart
+        - TVS integration still working (no regression)
+        - The old URL errors visible in logs are from BEFORE the backend restart (historical errors)
+        
+        CONCLUSION: The Hero eCatalogue URL migration bug fix is WORKING. The previous "origin web server returned an invalid or incomplete response to Cloudflare" error is resolved. Hero searches now successfully connect to the new endpoint and return correct part data.
         NO CRITICAL ISSUES FOUND. Backend is production-ready.

@@ -52,7 +52,7 @@ free MongoDB Atlas cluster.
    MONGO_URL=<from Step 2>
    DB_NAME=hmcl_prod
    JWT_SECRET=<generate a long random string, e.g. `python -c "import secrets; print(secrets.token_urlsafe(48))"`>
-   HERO_ECATALOGUE_URL=https://ecatalogue.heromotocorp.com/eCatalogueRestAPI/
+   HERO_ECATALOGUE_URL=https://ecatalogue.heromotocorp.biz:8080/HeroeCat/
    ADMIN_USERNAME=admin
    ADMIN_PASSWORD=<strong password>
    CORS_ORIGINS=<frontend Railway URL, comma-separated if multiple>
