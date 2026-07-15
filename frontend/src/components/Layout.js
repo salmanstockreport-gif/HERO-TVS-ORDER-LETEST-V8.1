@@ -14,7 +14,6 @@ import {
   PushPin,
   ArrowsLeftRight,
   Users,
-  Motorcycle,
 } from "@phosphor-icons/react";
 import { useAuth } from "@/context/AuthContext";
 import { useSystem, SYSTEMS } from "@/context/SystemContext";
@@ -178,17 +177,22 @@ export default function Layout() {
           >
             <div
               style={{
-                width: 26,
-                height: 26,
-                background: meta.accent,
+                width: 34,
+                height: 34,
+                background: "#ffffff",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
-                borderRadius: 2,
+                borderRadius: 3,
+                padding: 3,
                 flexShrink: 0,
               }}
             >
-              <Motorcycle size={14} color="#fff" weight="fill" />
+              <img
+                src={system === "hero" ? "/hero-logo.webp" : "/tvs-logo.webp"}
+                alt={`${meta.label} logo`}
+                style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+              />
             </div>
             <div style={{ flex: 1, textAlign: "left" }}>
               <div className="text-[10px] overline" style={{ color: meta.accent }}>

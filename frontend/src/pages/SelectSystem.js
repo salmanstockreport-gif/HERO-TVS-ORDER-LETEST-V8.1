@@ -1,10 +1,11 @@
 import React, { useEffect } from "react";
 import { useNavigate, Navigate } from "react-router-dom";
-import { Motorcycle, ArrowRight, Gear, SignOut } from "@phosphor-icons/react";
+import { ArrowRight, Gear, SignOut } from "@phosphor-icons/react";
 import { useAuth } from "@/context/AuthContext";
 import { useSystem, SYSTEMS } from "@/context/SystemContext";
 
 function SystemCard({ meta, onPick, disabled }) {
+  const logoSrc = meta.key === "hero" ? "/hero-logo.webp" : "/tvs-logo.webp";
   return (
     <button
       type="button"
@@ -25,7 +26,7 @@ function SystemCard({ meta, onPick, disabled }) {
         display: "flex",
         flexDirection: "column",
         gap: 24,
-        minHeight: 240,
+        minHeight: 300,
         position: "relative",
         overflow: "hidden",
       }}
@@ -50,23 +51,32 @@ function SystemCard({ meta, onPick, disabled }) {
           background: meta.accent,
         }}
       />
-      <div className="flex items-start justify-between">
-        <div
-          className="w-14 h-14 flex items-center justify-center"
+      <div
+        style={{
+          background: "#ffffff",
+          borderRadius: 4,
+          padding: "18px 20px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          minHeight: 110,
+        }}
+      >
+        <img
+          src={logoSrc}
+          alt={`${meta.label} logo`}
           style={{
-            background: `${meta.accent}22`,
-            border: `1px solid ${meta.accent}66`,
-            borderRadius: 4,
+            maxWidth: "100%",
+            maxHeight: 80,
+            objectFit: "contain",
           }}
-        >
-          <Motorcycle size={26} color={meta.accent} weight="fill" />
-        </div>
-        <div className="overline" style={{ color: meta.accent }}>
-          {meta.key.toUpperCase()}
-        </div>
+        />
       </div>
       <div>
-        <div className="font-display font-bold" style={{ fontSize: 26, lineHeight: 1.1 }}>
+        <div className="overline" style={{ color: meta.accent, marginBottom: 6 }}>
+          {meta.key.toUpperCase()}
+        </div>
+        <div className="font-display font-bold" style={{ fontSize: 24, lineHeight: 1.1 }}>
           {meta.label}
         </div>
         <div className="text-sm mt-2" style={{ color: "var(--hero-muted)" }}>

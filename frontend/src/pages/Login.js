@@ -74,6 +74,34 @@ export default function LoginPage() {
           eCatalogue, share one inventory sheet, and manage orders with fine
           employee-level permissions.
         </p>
+        <div
+          className="mt-10 flex items-center gap-6"
+          style={{
+            padding: "18px 24px",
+            background: "#ffffff",
+            borderRadius: 4,
+            width: "fit-content",
+            boxShadow: "0 4px 20px rgba(0,0,0,0.4)",
+          }}
+        >
+          <img
+            src="/hero-logo.webp"
+            alt="Hero MotoCorp"
+            style={{ height: 44, objectFit: "contain" }}
+          />
+          <div
+            style={{
+              width: 1,
+              alignSelf: "stretch",
+              background: "#e5e7eb",
+            }}
+          />
+          <img
+            src="/tvs-logo.webp"
+            alt="TVS Motor"
+            style={{ height: 44, objectFit: "contain" }}
+          />
+        </div>
       </div>
       <div className="login-form-panel"
         style={{
