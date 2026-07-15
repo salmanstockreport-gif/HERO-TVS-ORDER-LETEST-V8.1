@@ -42,6 +42,31 @@ security = HTTPBearer(auto_error=False)
 JWT_ALGORITHM = "HS256"
 JWT_SECRET = os.environ["JWT_SECRET"]
 HERO_URL = os.environ["HERO_ECATALOGUE_URL"]
+TVS_URL = os.environ.get("TVS_ECOMMERCE_API_URL", "https://www.advantagetvs.com/PartEcommerceAPI/")
+TVS_DEALER_ID = int(os.environ.get("TVS_DEALER_ID", "10001"))
+TVS_BRANCH_ID = int(os.environ.get("TVS_BRANCH_ID", "1"))
+TVS_CUSTOMER_TYPE = os.environ.get("TVS_CUSTOMER_TYPE", "Customer")
+
+# Supported systems
+SYSTEMS = ("hero", "tvs")
+
+# Employee permission keys. Owner accounts always bypass these checks.
+PERMISSION_KEYS = [
+    "orders_create_edit",
+    "orders_delete",
+    "orders_mark_sent",
+    "search_ecatalogue",
+    "inventory_view",
+    "inventory_upload",
+    "manage_important_parts",
+    "manage_mandatory_parts",
+    "change_discount",
+    "backup_restore",
+]
+
+
+def default_permissions(all_true: bool = False) -> dict:
+    return {k: bool(all_true) for k in PERMISSION_KEYS}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -81,7 +106,49 @@ async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] =
     user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    # Legacy users may not have role/systems/permissions -- default to owner (backwards compat)
+    user.setdefault("role", "owner")
+    user.setdefault("systems", list(SYSTEMS))
+    perms = default_permissions(all_true=(user["role"] == "owner"))
+    perms.update(user.get("permissions") or {})
+    user["permissions"] = perms
     return user
+
+
+def is_owner(user: dict) -> bool:
+    return user.get("role") == "owner"
+
+
+def require_owner(current_user: dict = Depends(get_current_user)) -> dict:
+    if not is_owner(current_user):
+        raise HTTPException(status_code=403, detail="Owner access required")
+    return current_user
+
+
+def require_permission(perm: str):
+    """Return a dependency that ensures the current user has the given permission
+    (owners bypass). Also returns the user dict."""
+
+    async def _dep(current_user: dict = Depends(get_current_user)) -> dict:
+        if is_owner(current_user):
+            return current_user
+        if not current_user.get("permissions", {}).get(perm):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Missing permission: {perm}",
+            )
+        return current_user
+
+    return _dep
+
+
+def require_system_access(user: dict, system: str) -> None:
+    if system not in SYSTEMS:
+        raise HTTPException(status_code=400, detail=f"Invalid system: {system}")
+    if is_owner(user):
+        return
+    if system not in (user.get("systems") or []):
+        raise HTTPException(status_code=403, detail=f"No access to {system} system")
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +204,80 @@ class HeroClient:
 
 
 hero_client = HeroClient(HERO_URL)
+
+
+# ---------------------------------------------------------------------------
+# TVS eCatalogue client (advantagetvs.com PartEcommerceAPI)
+# ---------------------------------------------------------------------------
+class TVSClient:
+    def __init__(self, base_url: str, dealer_id: int, branch_id: int, cust_type: str):
+        self.base_url = base_url.rstrip("/") + "/"
+        self.dealer_id = dealer_id
+        self.branch_id = branch_id
+        self.cust_type = cust_type
+        self._token: Optional[str] = None
+        self._token_ts: Optional[datetime] = None
+
+    def _refresh_token(self) -> None:
+        r = requests.post(
+            self.base_url + "Setting/tokenGeneration",
+            headers={"Content-Type": "application/json"},
+            json={
+                "dealerId": self.dealer_id,
+                "branchId": self.branch_id,
+                "Type": self.cust_type,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        self._token = data.get("access_token")
+        self._token_ts = datetime.now(timezone.utc)
+
+    def _ensure_token(self) -> None:
+        if self._token is None or self._token_ts is None:
+            self._refresh_token()
+            return
+        # Access tokens refresh every 30 minutes (TVS runtime uses similar cadence)
+        if datetime.now(timezone.utc) - self._token_ts > timedelta(minutes=25):
+            self._refresh_token()
+
+    def search_part(self, part_no: str) -> Dict[str, Any]:
+        self._ensure_token()
+        params = {
+            "partid": (part_no or "").strip(),
+            "description": "",
+            "partdesc": "",
+            "partSeries": "",
+            "modelID": "",
+            "page": 1,
+            "pageSize": 100,
+            "frameNumber": "",
+        }
+        headers = {
+            "Content-Type": "text/plain",
+            "Authorization": f"Bearer {self._token}",
+        }
+        r = requests.get(
+            self.base_url + "api/Catalouge/GetPartsearch",
+            params=params,
+            headers=headers,
+            timeout=25,
+        )
+        if r.status_code in (401, 403):
+            self._refresh_token()
+            headers["Authorization"] = f"Bearer {self._token}"
+            r = requests.get(
+                self.base_url + "api/Catalouge/GetPartsearch",
+                params=params,
+                headers=headers,
+                timeout=25,
+            )
+        r.raise_for_status()
+        return r.json()
+
+
+tvs_client = TVSClient(TVS_URL, TVS_DEALER_ID, TVS_BRANCH_ID, TVS_CUSTOMER_TYPE)
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +345,20 @@ class MandatoryToggleBody(BaseModel):
     enabled: bool
 
 
+# ------ Employee / user-management payloads ------
+class EmployeeCreate(BaseModel):
+    username: str
+    password: str
+    systems: List[str] = ["hero"]
+    permissions: Dict[str, bool] = {}
+
+
+class EmployeeUpdate(BaseModel):
+    password: Optional[str] = None
+    systems: Optional[List[str]] = None
+    permissions: Optional[Dict[str, bool]] = None
+
+
 # Inventory freshness window (hours)
 INVENTORY_TTL_HOURS = 24
 
@@ -234,10 +389,14 @@ def format_part_no_display(pn: str) -> str:
     return p
 
 
-async def generate_order_no() -> str:
+SYSTEM_ORDER_PREFIX = {"hero": "HMC", "tvs": "TVS"}
+
+
+async def generate_order_no(system: str = "hero") -> str:
+    prefix_root = SYSTEM_ORDER_PREFIX.get(system, "HMC")
     date_part = datetime.now(timezone.utc).strftime("%Y%m%d")
-    prefix = f"HMC-{date_part}-"
-    # find last order for today
+    prefix = f"{prefix_root}-{date_part}-"
+    # find last order for today for this system
     cursor = db.orders.find({"order_no": {"$regex": f"^{prefix}"}}).sort("order_no", -1).limit(1)
     docs = await cursor.to_list(1)
     if docs:
@@ -334,10 +493,20 @@ async def login(body: LoginRequest):
     if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     token = create_access_token(user["id"], user["username"])
+    role = user.get("role", "owner")
+    systems = user.get("systems") or list(SYSTEMS)
+    perms = default_permissions(all_true=(role == "owner"))
+    perms.update(user.get("permissions") or {})
     return {
         "access_token": token,
         "token_type": "bearer",
-        "user": {"id": user["id"], "username": user["username"], "role": user.get("role", "admin")},
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "role": role,
+            "systems": systems,
+            "permissions": perms,
+        },
     }
 
 
@@ -373,13 +542,19 @@ async def change_credentials(body: CredentialsUpdate, current_user: dict = Depen
     updates["updated_at"] = now_iso()
     await db.users.update_one({"id": user["id"]}, {"$set": updates})
     token = create_access_token(user["id"], updates.get("username", user["username"]))
+    role = user.get("role", "owner")
+    systems = user.get("systems") or list(SYSTEMS)
+    perms = default_permissions(all_true=(role == "owner"))
+    perms.update(user.get("permissions") or {})
     return {
         "success": True,
         "access_token": token,
         "user": {
             "id": user["id"],
             "username": updates.get("username", user["username"]),
-            "role": user.get("role", "admin"),
+            "role": role,
+            "systems": systems,
+            "permissions": perms,
         },
     }
 
@@ -397,6 +572,8 @@ async def get_settings(current_user: dict = Depends(get_current_user)):
 
 @api_router.put("/settings/discount")
 async def update_discount(body: DiscountUpdate, current_user: dict = Depends(get_current_user)):
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("change_discount"):
+        raise HTTPException(status_code=403, detail="Missing permission: change_discount")
     if body.discount_percent < 0 or body.discount_percent > 100:
         raise HTTPException(status_code=400, detail="Discount must be between 0 and 100")
     await db.settings.update_one(
@@ -412,6 +589,9 @@ async def update_discount(body: DiscountUpdate, current_user: dict = Depends(get
 # ---------------------------------------------------------------------------
 @api_router.get("/hero/search")
 async def hero_search(q: str, current_user: dict = Depends(require_fresh_inventory)):
+    require_system_access(current_user, "hero")
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("search_ecatalogue"):
+        raise HTTPException(status_code=403, detail="Missing permission: search_ecatalogue")
     q = (q or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="Search query required")
@@ -442,12 +622,66 @@ async def hero_search(q: str, current_user: dict = Depends(require_fresh_invento
     return {"query": q, "parts": parts, "count": len(parts)}
 
 
+@api_router.get("/tvs/search")
+async def tvs_search(q: str, current_user: dict = Depends(require_fresh_inventory)):
+    """Search the TVS advantagetvs.com eCatalogue by part number."""
+    require_system_access(current_user, "tvs")
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("search_ecatalogue"):
+        raise HTTPException(status_code=403, detail="Missing permission: search_ecatalogue")
+    q = (q or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Search query required")
+    try:
+        data = tvs_client.search_part(q)
+    except requests.RequestException as e:
+        logger.exception("tvs search failed")
+        raise HTTPException(status_code=502, detail=f"TVS eCatalogue unreachable: {e}")
+
+    inner = data.get("data") or {}
+    rows = inner.get("ModelsAppies") or []
+
+    # Dedupe per-partno keeping first (top) occurrence -- TVS returns one row per model variant.
+    seen: set = set()
+    parts: List[dict] = []
+    for r in rows:
+        pn = str(r.get("PARTNO") or "").strip()
+        if not pn or pn in seen:
+            continue
+        seen.add(pn)
+        try:
+            mrp = float(r.get("MRP") or 0)
+        except Exception:
+            mrp = 0.0
+        try:
+            moq = float(r.get("MOQ") or 0)
+        except Exception:
+            moq = 0.0
+        parts.append({
+            "part_no": pn,
+            "part_no_original": pn,
+            "description": r.get("PartDescription") or "",
+            "type": r.get("SEGMENT_NAME") or "",
+            "series": r.get("SERIES_NAME") or "",
+            "model": r.get("MODEL_NAME") or "",
+            "variant": r.get("VARIENT") or "",
+            "moq": moq,
+            "mrp": mrp,
+            "image_url": None,
+        })
+    return {"query": q, "parts": parts, "count": len(parts), "raw_rows": len(rows)}
+
+
 # ---------------------------------------------------------------------------
 # Orders
 # ---------------------------------------------------------------------------
 @api_router.get("/orders")
-async def list_orders(status: Optional[str] = None, current_user: dict = Depends(get_current_user)):
-    query: dict = {}
+async def list_orders(
+    system: str = "hero",
+    status: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    require_system_access(current_user, system)
+    query: dict = {"system": system}
     if status in ("current", "sent"):
         query["status"] = status
     cursor = db.orders.find(query, {"_id": 0}).sort("created_at", -1)
@@ -460,39 +694,41 @@ async def get_order(order_id: str, current_user: dict = Depends(get_current_user
     order = await db.orders.find_one({"id": order_id}, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    require_system_access(current_user, order.get("system", "hero"))
     return order
 
 
-async def _ensure_current_orders_limit() -> None:
-    """Raise 409 if the concurrent-current-orders cap is already hit."""
-    current_count = await db.orders.count_documents({"status": "current"})
+async def _ensure_current_orders_limit(system: str) -> None:
+    """Raise 409 if the concurrent-current-orders cap is already hit for this system."""
+    current_count = await db.orders.count_documents({"status": "current", "system": system})
     if current_count >= MAX_CURRENT_ORDERS:
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "current_orders_limit",
                 "message": (
-                    f"You already have {current_count} current orders. "
+                    f"You already have {current_count} current {system.upper()} orders. "
                     f"Mark one as sent (or delete it) before starting a new one. "
                     f"Limit: {MAX_CURRENT_ORDERS}."
                 ),
                 "limit": MAX_CURRENT_ORDERS,
                 "current_count": current_count,
+                "system": system,
             },
         )
 
 
 async def _resolve_new_order_items(
-    incoming: List[OrderItem], global_discount: float
+    incoming: List[OrderItem], global_discount: float, system: str = "hero"
 ) -> List[dict]:
     """Auto-inject mandatory parts (when toggle is on and incoming is empty),
     dedupe by normalized part number, and compute per-line totals."""
-    mand_toggle = await db.settings.find_one({"key": "mandatory_parts_toggle"}) or {}
+    mand_toggle = await db.settings.find_one({"key": f"mandatory_parts_toggle:{system}"}) or {}
     mand_enabled = bool(mand_toggle.get("enabled", False))
 
     items_in = list(incoming)
     if mand_enabled and not items_in:
-        async for mp in db.mandatory_parts.find({}, {"_id": 0}):
+        async for mp in db.mandatory_parts.find({"system": system}, {"_id": 0}):
             items_in.append(OrderItem(
                 part_no=mp.get("part_no", ""),
                 description=mp.get("description", ""),
@@ -514,16 +750,24 @@ async def _resolve_new_order_items(
 
 
 @api_router.post("/orders")
-async def create_order(body: OrderCreate, current_user: dict = Depends(require_fresh_inventory)) -> dict:
-    await _ensure_current_orders_limit()
+async def create_order(
+    body: OrderCreate,
+    system: str = "hero",
+    current_user: dict = Depends(require_fresh_inventory),
+) -> dict:
+    require_system_access(current_user, system)
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("orders_create_edit"):
+        raise HTTPException(status_code=403, detail="Missing permission: orders_create_edit")
+    await _ensure_current_orders_limit(system)
 
     settings = await db.settings.find_one({"key": "global"}) or {}
     global_discount = float(settings.get("discount_percent") or 0.0)
-    items = await _resolve_new_order_items(body.items or [], global_discount)
+    items = await _resolve_new_order_items(body.items or [], global_discount, system)
 
     order = {
         "id": str(uuid.uuid4()),
-        "order_no": await generate_order_no(),
+        "order_no": await generate_order_no(system),
+        "system": system,
         "status": "current",
         "items": items,
         "remarks": body.remarks,
@@ -543,6 +787,9 @@ async def update_order(order_id: str, body: OrderUpdate, current_user: dict = De
     order = await db.orders.find_one({"id": order_id})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    require_system_access(current_user, order.get("system", "hero"))
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("orders_create_edit"):
+        raise HTTPException(status_code=403, detail="Missing permission: orders_create_edit")
     if order.get("status") == "sent":
         raise HTTPException(status_code=400, detail="Cannot edit a sent order")
 
@@ -578,6 +825,9 @@ async def mark_sent(order_id: str, current_user: dict = Depends(require_fresh_in
     order = await db.orders.find_one({"id": order_id})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    require_system_access(current_user, order.get("system", "hero"))
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("orders_mark_sent"):
+        raise HTTPException(status_code=403, detail="Missing permission: orders_mark_sent")
     if not order.get("items"):
         raise HTTPException(status_code=400, detail="Cannot send an empty order")
     await db.orders.update_one(
@@ -593,6 +843,9 @@ async def reopen_order(order_id: str, current_user: dict = Depends(get_current_u
     order = await db.orders.find_one({"id": order_id})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    require_system_access(current_user, order.get("system", "hero"))
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("orders_mark_sent"):
+        raise HTTPException(status_code=403, detail="Missing permission: orders_mark_sent")
     await db.orders.update_one(
         {"id": order_id},
         {"$set": {"status": "current", "sent_at": None, "updated_at": now_iso()}},
@@ -608,17 +861,27 @@ async def delete_order(order_id: str, confirm: str = "", current_user: dict = De
             status_code=400,
             detail="Delete not confirmed. Type 'delete' to confirm.",
         )
-    r = await db.orders.delete_one({"id": order_id})
-    if r.deleted_count == 0:
+    order = await db.orders.find_one({"id": order_id})
+    if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    require_system_access(current_user, order.get("system", "hero"))
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("orders_delete"):
+        raise HTTPException(status_code=403, detail="Missing permission: orders_delete")
+    await db.orders.delete_one({"id": order_id})
     return {"success": True}
 
 
 @api_router.get("/orders/check-part/{part_no}")
-async def check_part_history(part_no: str, exclude_order_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
-    """Warn only if this part was in the MOST RECENT previous order sheet."""
+async def check_part_history(
+    part_no: str,
+    system: str = "hero",
+    exclude_order_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Warn only if this part was in the MOST RECENT previous order sheet (same system)."""
+    require_system_access(current_user, system)
     norm = normalize_part_no(part_no)
-    query: dict = {"items.part_no": {"$exists": True}}
+    query: dict = {"system": system, "items.part_no": {"$exists": True}}
     if exclude_order_id:
         query["id"] = {"$ne": exclude_order_id}
     # Find only the most recent order (excluding the current one)
@@ -666,11 +929,24 @@ def _excel_add_logo(ws) -> None:
         pass
 
 
+def _system_brand_meta(system: str) -> Dict[str, str]:
+    if system == "tvs":
+        return {
+            "brand_line": "TVS Motor Genuine Parts",
+            "brand_color": "#1E3A8A",  # TVS blue
+        }
+    return {
+        "brand_line": "Hero MotoCorp Genuine Parts Dealer",
+        "brand_color": "#B31229",  # Hero red
+    }
+
+
 def _excel_write_header(ws, order: dict) -> None:
     ws.row_dimensions[1].height = 45
     ws["B1"] = "KABIR AUTO PARTS"
-    ws["B1"].font = Font(bold=True, size=18, color="B31229")
-    ws["B2"] = "Hero MotoCorp Genuine Parts Dealer"
+    meta = _system_brand_meta(order.get("system", "hero"))
+    ws["B1"].font = Font(bold=True, size=18, color=meta["brand_color"].lstrip("#"))
+    ws["B2"] = meta["brand_line"]
     ws["B2"].font = Font(italic=True, color="666666", size=10)
     ws.merge_cells("B1:E1")
     ws.merge_cells("B2:E2")
@@ -679,7 +955,7 @@ def _excel_write_header(ws, order: dict) -> None:
     ws["F1"].font = Font(bold=True, size=12)
     ws.merge_cells("F1:I1")
     ws["F2"] = order["order_no"]
-    ws["F2"].font = Font(bold=True, size=11, color="B31229")
+    ws["F2"].font = Font(bold=True, size=11, color=meta["brand_color"].lstrip("#"))
     ws.merge_cells("F2:I2")
 
     ws["A4"] = f"Status: {order['status'].upper()}"
@@ -701,11 +977,14 @@ def _excel_write_items_table(ws, order: dict, header_row: int = 9) -> int:
 
     total_qty = 0
     items = order.get("items", []) or []
+    is_hero = (order.get("system", "hero") == "hero")
     for idx, item in enumerate(items, start=1):
         row = header_row + idx
+        pn_raw = item.get("part_no", "")
+        pn_display = format_part_no_display(pn_raw) if is_hero else pn_raw
         vals = [
             idx,
-            format_part_no_display(item.get("part_no", "")),
+            pn_display,
             item.get("description", ""),
             item.get("qty", 0),
         ]
@@ -763,9 +1042,10 @@ def _pdf_header_row(order: dict, style_map: dict) -> Table:
             logo_cell = RLImage(str(LOGO_PATH), width=22 * mm, height=22 * mm)
         except Exception:
             logo_cell = ""
+    meta = _system_brand_meta(order.get("system", "hero"))
     brand_para = Paragraph(
         "<b>KABIR AUTO PARTS</b><br/>"
-        "<font size=8 color='#666666'>Hero MotoCorp Genuine Parts Dealer</font>",
+        f"<font size=8 color='#666666'>{meta['brand_line']}</font>",
         style_map["brand"],
     )
     order_meta = Paragraph(
@@ -775,6 +1055,7 @@ def _pdf_header_row(order: dict, style_map: dict) -> Table:
         f"{order['created_at'][:10]}</font>",
         style_map["subtitle"],
     )
+    line_color = colors.HexColor(meta["brand_color"] if order.get("system") == "hero" else "#1E3A8A")
     header_table = Table(
         [[logo_cell, brand_para, order_meta]],
         colWidths=[26 * mm, 160 * mm, 80 * mm],
@@ -782,7 +1063,7 @@ def _pdf_header_row(order: dict, style_map: dict) -> Table:
     header_table.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("ALIGN", (2, 0), (2, 0), "RIGHT"),
-        ("LINEBELOW", (0, 0), (-1, -1), 1.2, colors.HexColor("#E31837")),
+        ("LINEBELOW", (0, 0), (-1, -1), 1.2, line_color),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
     return header_table
@@ -791,19 +1072,23 @@ def _pdf_header_row(order: dict, style_map: dict) -> Table:
 def _pdf_items_table(order: dict) -> Table:
     data = [["S.No.", "Part No.", "Description", "Qty"]]
     total_qty = 0
+    is_hero = (order.get("system", "hero") == "hero")
     for idx, item in enumerate(order.get("items", []) or [], start=1):
+        pn_raw = item.get("part_no", "")
+        pn_display = format_part_no_display(pn_raw) if is_hero else pn_raw
         data.append([
             str(idx),
-            format_part_no_display(item.get("part_no", "")),
+            pn_display,
             str(item.get("description", ""))[:80],
             str(item.get("qty", 0)),
         ])
         total_qty += int(item.get("qty") or 0)
     data.append(["", "", "TOTAL QTY", str(total_qty)])
 
+    header_bg = colors.HexColor("#E31837" if is_hero else "#1E3A8A")
     table = Table(data, colWidths=[20 * mm, 45 * mm, 165 * mm, 25 * mm], repeatRows=1)
     table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E31837")),
+        ("BACKGROUND", (0, 0), (-1, 0), header_bg),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("FONTSIZE", (0, 0), (-1, -1), 10),
@@ -849,7 +1134,9 @@ def build_order_pdf(order: dict) -> bytes:
     story.append(_pdf_items_table(order))
     story.append(Spacer(1, 6 * mm))
     story.append(Paragraph(
-        "<font size=7 color='#888888'>Generated by Kabir Auto Parts · Hero MotoCorp Parts Ordering System</font>",
+        f"<font size=7 color='#888888'>Generated by Kabir Auto Parts · "
+        f"{'Hero MotoCorp' if order.get('system','hero') == 'hero' else 'TVS Motor'} "
+        f"Parts Ordering System</font>",
         style_map["subtitle"],
     ))
 
@@ -969,6 +1256,8 @@ async def inventory_upload(
     replace: bool = Form(True),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("inventory_upload"):
+        raise HTTPException(status_code=403, detail="Missing permission: inventory_upload")
     content = await file.read()
     df = read_upload_to_df(file, content)
 
@@ -1034,8 +1323,12 @@ async def lookup_inventory(part_no: str, current_user: dict = Depends(get_curren
 # Important Parts (low-stock alerts on dashboard)
 # ---------------------------------------------------------------------------
 @api_router.get("/important-parts")
-async def list_important_parts(current_user: dict = Depends(get_current_user)):
-    docs = await db.important_parts.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+async def list_important_parts(
+    system: str = "hero",
+    current_user: dict = Depends(get_current_user),
+):
+    require_system_access(current_user, system)
+    docs = await db.important_parts.find({"system": system}, {"_id": 0}).sort("created_at", -1).to_list(500)
     # enrich with current stock
     for d in docs:
         inv = await db.inventory.find_one(
@@ -1047,17 +1340,26 @@ async def list_important_parts(current_user: dict = Depends(get_current_user)):
 
 
 @api_router.post("/important-parts")
-async def add_important_part(body: ImportantPartBody, current_user: dict = Depends(get_current_user)):
+async def add_important_part(
+    body: ImportantPartBody,
+    system: str = "hero",
+    current_user: dict = Depends(get_current_user),
+):
+    require_system_access(current_user, system)
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("manage_important_parts"):
+        raise HTTPException(status_code=403, detail="Missing permission: manage_important_parts")
     pn = (body.part_no or "").strip()
     if not pn:
         raise HTTPException(status_code=400, detail="Part number is required")
     norm = normalize_part_no(pn)
-    existing = await db.important_parts.find_one({"part_no_norm": norm})
+    existing = await db.important_parts.find_one({"system": system, "part_no_norm": norm})
     if existing:
         raise HTTPException(status_code=400, detail=f"{pn} is already in the important list")
+    display_pn = format_part_no_display(pn) if system == "hero" else pn
     doc = {
         "id": str(uuid.uuid4()),
-        "part_no": format_part_no_display(pn),
+        "system": system,
+        "part_no": display_pn,
         "part_no_norm": norm,
         "description": body.description or "",
         "threshold_qty": float(body.threshold_qty or 1),
@@ -1070,22 +1372,30 @@ async def add_important_part(body: ImportantPartBody, current_user: dict = Depen
 
 @api_router.put("/important-parts/{item_id}")
 async def update_important_part(item_id: str, body: ImportantPartBody, current_user: dict = Depends(get_current_user)):
+    existing = await db.important_parts.find_one({"id": item_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_system_access(current_user, existing.get("system", "hero"))
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("manage_important_parts"):
+        raise HTTPException(status_code=403, detail="Missing permission: manage_important_parts")
     updates = {
         "description": body.description or "",
         "threshold_qty": float(body.threshold_qty or 1),
         "updated_at": now_iso(),
     }
-    r = await db.important_parts.update_one({"id": item_id}, {"$set": updates})
-    if r.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Not found")
+    await db.important_parts.update_one({"id": item_id}, {"$set": updates})
     return {"success": True}
 
 
 @api_router.delete("/important-parts/{item_id}")
 async def delete_important_part(item_id: str, current_user: dict = Depends(get_current_user)):
-    r = await db.important_parts.delete_one({"id": item_id})
-    if r.deleted_count == 0:
+    existing = await db.important_parts.find_one({"id": item_id})
+    if not existing:
         raise HTTPException(status_code=404, detail="Not found")
+    require_system_access(current_user, existing.get("system", "hero"))
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("manage_important_parts"):
+        raise HTTPException(status_code=403, detail="Missing permission: manage_important_parts")
+    await db.important_parts.delete_one({"id": item_id})
     return {"success": True}
 
 
@@ -1093,24 +1403,37 @@ async def delete_important_part(item_id: str, current_user: dict = Depends(get_c
 # Mandatory Parts (auto-add to every new order sheet when toggle is on)
 # ---------------------------------------------------------------------------
 @api_router.get("/mandatory-parts")
-async def list_mandatory_parts(current_user: dict = Depends(get_current_user)):
-    docs = await db.mandatory_parts.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
-    toggle = await db.settings.find_one({"key": "mandatory_parts_toggle"}) or {}
+async def list_mandatory_parts(
+    system: str = "hero",
+    current_user: dict = Depends(get_current_user),
+):
+    require_system_access(current_user, system)
+    docs = await db.mandatory_parts.find({"system": system}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    toggle = await db.settings.find_one({"key": f"mandatory_parts_toggle:{system}"}) or {}
     return {"parts": docs, "enabled": bool(toggle.get("enabled", False))}
 
 
 @api_router.post("/mandatory-parts")
-async def add_mandatory_part(body: MandatoryPartBody, current_user: dict = Depends(get_current_user)):
+async def add_mandatory_part(
+    body: MandatoryPartBody,
+    system: str = "hero",
+    current_user: dict = Depends(get_current_user),
+):
+    require_system_access(current_user, system)
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("manage_mandatory_parts"):
+        raise HTTPException(status_code=403, detail="Missing permission: manage_mandatory_parts")
     pn = (body.part_no or "").strip()
     if not pn:
         raise HTTPException(status_code=400, detail="Part number is required")
     norm = normalize_part_no(pn)
-    existing = await db.mandatory_parts.find_one({"part_no_norm": norm})
+    existing = await db.mandatory_parts.find_one({"system": system, "part_no_norm": norm})
     if existing:
         raise HTTPException(status_code=400, detail=f"{pn} is already in the mandatory list")
+    display_pn = format_part_no_display(pn) if system == "hero" else pn
     doc = {
         "id": str(uuid.uuid4()),
-        "part_no": format_part_no_display(pn),
+        "system": system,
+        "part_no": display_pn,
         "part_no_norm": norm,
         "description": body.description or "",
         "mrp": float(body.mrp or 0),
@@ -1124,31 +1447,47 @@ async def add_mandatory_part(body: MandatoryPartBody, current_user: dict = Depen
 
 @api_router.put("/mandatory-parts/{item_id}")
 async def update_mandatory_part(item_id: str, body: MandatoryPartBody, current_user: dict = Depends(get_current_user)):
+    existing = await db.mandatory_parts.find_one({"id": item_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_system_access(current_user, existing.get("system", "hero"))
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("manage_mandatory_parts"):
+        raise HTTPException(status_code=403, detail="Missing permission: manage_mandatory_parts")
     updates = {
         "description": body.description or "",
         "mrp": float(body.mrp or 0),
         "qty": int(body.qty or 1),
         "updated_at": now_iso(),
     }
-    r = await db.mandatory_parts.update_one({"id": item_id}, {"$set": updates})
-    if r.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Not found")
+    await db.mandatory_parts.update_one({"id": item_id}, {"$set": updates})
     return {"success": True}
 
 
 @api_router.delete("/mandatory-parts/{item_id}")
 async def delete_mandatory_part(item_id: str, current_user: dict = Depends(get_current_user)):
-    r = await db.mandatory_parts.delete_one({"id": item_id})
-    if r.deleted_count == 0:
+    existing = await db.mandatory_parts.find_one({"id": item_id})
+    if not existing:
         raise HTTPException(status_code=404, detail="Not found")
+    require_system_access(current_user, existing.get("system", "hero"))
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("manage_mandatory_parts"):
+        raise HTTPException(status_code=403, detail="Missing permission: manage_mandatory_parts")
+    await db.mandatory_parts.delete_one({"id": item_id})
     return {"success": True}
 
 
 @api_router.put("/mandatory-toggle")
-async def toggle_mandatory_parts(body: MandatoryToggleBody, current_user: dict = Depends(get_current_user)):
+async def toggle_mandatory_parts(
+    body: MandatoryToggleBody,
+    system: str = "hero",
+    current_user: dict = Depends(get_current_user),
+):
+    require_system_access(current_user, system)
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("manage_mandatory_parts"):
+        raise HTTPException(status_code=403, detail="Missing permission: manage_mandatory_parts")
+    key = f"mandatory_parts_toggle:{system}"
     await db.settings.update_one(
-        {"key": "mandatory_parts_toggle"},
-        {"$set": {"key": "mandatory_parts_toggle", "enabled": bool(body.enabled), "updated_at": now_iso()}},
+        {"key": key},
+        {"$set": {"key": key, "enabled": bool(body.enabled), "updated_at": now_iso()}},
         upsert=True,
     )
     return {"enabled": bool(body.enabled)}
@@ -1158,18 +1497,19 @@ async def toggle_mandatory_parts(body: MandatoryToggleBody, current_user: dict =
 # Dashboard
 # ---------------------------------------------------------------------------
 @api_router.get("/dashboard/stats")
-async def dashboard_stats(current_user: dict = Depends(get_current_user)):
-    current = await db.orders.count_documents({"status": "current"})
-    sent = await db.orders.count_documents({"status": "sent"})
+async def dashboard_stats(system: str = "hero", current_user: dict = Depends(get_current_user)):
+    require_system_access(current_user, system)
+    current = await db.orders.count_documents({"status": "current", "system": system})
+    sent = await db.orders.count_documents({"status": "sent", "system": system})
     inventory_count = await db.inventory.count_documents({})
     total_sent_value = 0.0
-    async for o in db.orders.find({"status": "sent"}, {"items": 1, "_id": 0}):
+    async for o in db.orders.find({"status": "sent", "system": system}, {"items": 1, "_id": 0}):
         for it in o.get("items", []):
             total_sent_value += float(it.get("line_total") or 0)
 
-    # low-stock alerts on important parts
+    # low-stock alerts on important parts (this system only)
     low_stock_alerts = []
-    async for ip in db.important_parts.find({}, {"_id": 0}):
+    async for ip in db.important_parts.find({"system": system}, {"_id": 0}):
         inv = await db.inventory.find_one(
             {"part_no_norm": ip.get("part_no_norm")}, {"_id": 0, "stock_qty": 1}
         )
@@ -1187,6 +1527,7 @@ async def dashboard_stats(current_user: dict = Depends(get_current_user)):
     inv_status = await get_inventory_status()
 
     return {
+        "system": system,
         "current_orders": current,
         "sent_orders": sent,
         "inventory_items": inventory_count,
@@ -1196,6 +1537,126 @@ async def dashboard_stats(current_user: dict = Depends(get_current_user)):
         "current_orders_limit": MAX_CURRENT_ORDERS,
         "current_orders_full": current >= MAX_CURRENT_ORDERS,
     }
+
+
+# ---------------------------------------------------------------------------
+# Employees (owner-only user management)
+# ---------------------------------------------------------------------------
+def _sanitize_permissions(perms: Optional[Dict[str, bool]]) -> Dict[str, bool]:
+    result = default_permissions(all_true=False)
+    if perms:
+        for k, v in perms.items():
+            if k in result:
+                result[k] = bool(v)
+    return result
+
+
+def _sanitize_systems(systems: Optional[List[str]]) -> List[str]:
+    out: List[str] = []
+    for s in (systems or []):
+        if s in SYSTEMS and s not in out:
+            out.append(s)
+    if not out:
+        out = ["hero"]
+    return out
+
+
+def _public_user(user: dict) -> dict:
+    return {
+        "id": user.get("id"),
+        "username": user.get("username"),
+        "role": user.get("role", "employee"),
+        "systems": user.get("systems") or [],
+        "permissions": user.get("permissions") or default_permissions(all_true=(user.get("role") == "owner")),
+        "created_at": user.get("created_at"),
+        "updated_at": user.get("updated_at"),
+    }
+
+
+@api_router.get("/permissions/keys")
+async def list_permission_keys(current_user: dict = Depends(get_current_user)):
+    """Returns the list of permission keys with human-readable labels."""
+    return {
+        "keys": [
+            {"key": "orders_create_edit", "label": "Create / edit orders"},
+            {"key": "orders_delete", "label": "Delete orders"},
+            {"key": "orders_mark_sent", "label": "Mark orders sent / reopen"},
+            {"key": "search_ecatalogue", "label": "Search eCatalogue (Hero / TVS)"},
+            {"key": "inventory_view", "label": "View inventory"},
+            {"key": "inventory_upload", "label": "Upload / replace inventory"},
+            {"key": "manage_important_parts", "label": "Manage important parts"},
+            {"key": "manage_mandatory_parts", "label": "Manage mandatory parts"},
+            {"key": "change_discount", "label": "Change discount setting"},
+            {"key": "backup_restore", "label": "Export / import database backup"},
+        ],
+        "systems": list(SYSTEMS),
+    }
+
+
+@api_router.get("/employees")
+async def list_employees(current_user: dict = Depends(require_owner)):
+    docs = await db.users.find(
+        {"role": {"$ne": "owner"}},
+        {"_id": 0, "password_hash": 0},
+    ).sort("created_at", -1).to_list(500)
+    return [_public_user(d) for d in docs]
+
+
+@api_router.post("/employees")
+async def create_employee(body: EmployeeCreate, current_user: dict = Depends(require_owner)):
+    uname = (body.username or "").strip().lower()
+    if len(uname) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+    if len(body.password or "") < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if await db.users.find_one({"username": uname}):
+        raise HTTPException(status_code=400, detail="Username is already taken")
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "username": uname,
+        "password_hash": hash_password(body.password),
+        "role": "employee",
+        "systems": _sanitize_systems(body.systems),
+        "permissions": _sanitize_permissions(body.permissions),
+        "created_at": now_iso(),
+    }
+    await db.users.insert_one(doc)
+    return _public_user(doc)
+
+
+@api_router.put("/employees/{employee_id}")
+async def update_employee(employee_id: str, body: EmployeeUpdate, current_user: dict = Depends(require_owner)):
+    user = await db.users.find_one({"id": employee_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    if user.get("role") == "owner":
+        raise HTTPException(status_code=400, detail="Cannot modify owner via employees endpoint")
+
+    updates: dict = {"updated_at": now_iso()}
+    if body.password:
+        if len(body.password) < 6:
+            raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+        updates["password_hash"] = hash_password(body.password)
+    if body.systems is not None:
+        updates["systems"] = _sanitize_systems(body.systems)
+    if body.permissions is not None:
+        updates["permissions"] = _sanitize_permissions(body.permissions)
+
+    await db.users.update_one({"id": employee_id}, {"$set": updates})
+    fresh = await db.users.find_one({"id": employee_id}, {"_id": 0, "password_hash": 0})
+    return _public_user(fresh or {})
+
+
+@api_router.delete("/employees/{employee_id}")
+async def delete_employee(employee_id: str, current_user: dict = Depends(require_owner)):
+    user = await db.users.find_one({"id": employee_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    if user.get("role") == "owner":
+        raise HTTPException(status_code=400, detail="Cannot delete owner account")
+    await db.users.delete_one({"id": employee_id})
+    return {"success": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1216,6 +1677,8 @@ BACKUP_COLLECTIONS = [
 @api_router.get("/db/export")
 async def export_database(current_user: dict = Depends(get_current_user)):
     """Stream a JSON backup of the entire database."""
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("backup_restore"):
+        raise HTTPException(status_code=403, detail="Missing permission: backup_restore")
     import json as _json
 
     payload: Dict[str, Any] = {
@@ -1272,9 +1735,23 @@ async def _recreate_core_indexes() -> None:
     await db.users.create_index("username", unique=True)
     await db.orders.create_index("order_no", unique=True)
     await db.orders.create_index("status")
+    await db.orders.create_index("system")
     await db.inventory.create_index("part_no_norm")
-    await db.important_parts.create_index("part_no_norm", unique=True)
-    await db.mandatory_parts.create_index("part_no_norm", unique=True)
+    # important_parts and mandatory_parts are unique per (system, part_no_norm)
+    try:
+        await db.important_parts.drop_index("part_no_norm_1")
+    except Exception:
+        pass
+    try:
+        await db.mandatory_parts.drop_index("part_no_norm_1")
+    except Exception:
+        pass
+    await db.important_parts.create_index(
+        [("system", 1), ("part_no_norm", 1)], unique=True, name="system_part_no_norm_uniq"
+    )
+    await db.mandatory_parts.create_index(
+        [("system", 1), ("part_no_norm", 1)], unique=True, name="system_part_no_norm_uniq"
+    )
 
 
 @api_router.post("/db/import")
@@ -1284,6 +1761,8 @@ async def import_database(
 ) -> dict:
     """Restore the database from a previously-exported JSON file. Wipes existing
     data in the affected collections and re-inserts the file's contents."""
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("backup_restore"):
+        raise HTTPException(status_code=403, detail="Missing permission: backup_restore")
     raw = await file.read()
     data = _parse_backup_payload(raw)
     collections = data["collections"]
@@ -1326,27 +1805,78 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
-    # indexes
+    # Backfill 'system' field on legacy documents (before creating new indexes).
+    await db.orders.update_many(
+        {"system": {"$exists": False}}, {"$set": {"system": "hero"}}
+    )
+    await db.important_parts.update_many(
+        {"system": {"$exists": False}}, {"$set": {"system": "hero"}}
+    )
+    await db.mandatory_parts.update_many(
+        {"system": {"$exists": False}}, {"$set": {"system": "hero"}}
+    )
+    # Migrate old mandatory_parts_toggle setting key -> mandatory_parts_toggle:hero
+    old_toggle = await db.settings.find_one({"key": "mandatory_parts_toggle"})
+    if old_toggle:
+        await db.settings.update_one(
+            {"key": "mandatory_parts_toggle:hero"},
+            {"$set": {
+                "key": "mandatory_parts_toggle:hero",
+                "enabled": bool(old_toggle.get("enabled", False)),
+                "updated_at": now_iso(),
+            }},
+            upsert=True,
+        )
+        await db.settings.delete_one({"key": "mandatory_parts_toggle"})
+
+    # indexes (may need to drop old ones)
     await db.users.create_index("username", unique=True)
     await db.orders.create_index("order_no", unique=True)
     await db.orders.create_index("status")
+    await db.orders.create_index("system")
     await db.inventory.create_index("part_no_norm")
-    await db.important_parts.create_index("part_no_norm", unique=True)
-    await db.mandatory_parts.create_index("part_no_norm", unique=True)
+    # Drop legacy single-field unique indexes if present -- replaced by composite
+    for coll in (db.important_parts, db.mandatory_parts):
+        try:
+            await coll.drop_index("part_no_norm_1")
+        except Exception:
+            pass
+    await db.important_parts.create_index(
+        [("system", 1), ("part_no_norm", 1)], unique=True, name="system_part_no_norm_uniq"
+    )
+    await db.mandatory_parts.create_index(
+        [("system", 1), ("part_no_norm", 1)], unique=True, name="system_part_no_norm_uniq"
+    )
 
-    # seed admin only if no admin user exists at all
+    # seed admin only if no owner user exists
     admin_username = os.environ.get("ADMIN_USERNAME", "admin").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
-    any_admin = await db.users.find_one({"role": "admin"})
-    if any_admin is None:
-        await db.users.insert_one({
-            "id": str(uuid.uuid4()),
-            "username": admin_username,
-            "password_hash": hash_password(admin_password),
-            "role": "admin",
-            "created_at": now_iso(),
-        })
-        logger.info(f"Seeded admin user: {admin_username}")
+    any_owner = await db.users.find_one({"role": "owner"})
+    if any_owner is None:
+        # Upgrade any pre-existing legacy admin user, else create fresh owner
+        legacy = await db.users.find_one({"username": admin_username})
+        if legacy is not None:
+            await db.users.update_one(
+                {"id": legacy["id"]},
+                {"$set": {
+                    "role": "owner",
+                    "systems": list(SYSTEMS),
+                    "permissions": default_permissions(all_true=True),
+                    "updated_at": now_iso(),
+                }},
+            )
+            logger.info(f"Upgraded existing user '{admin_username}' to owner")
+        else:
+            await db.users.insert_one({
+                "id": str(uuid.uuid4()),
+                "username": admin_username,
+                "password_hash": hash_password(admin_password),
+                "role": "owner",
+                "systems": list(SYSTEMS),
+                "permissions": default_permissions(all_true=True),
+                "created_at": now_iso(),
+            })
+            logger.info(f"Seeded owner user: {admin_username}")
 
     # seed default settings
     if not await db.settings.find_one({"key": "global"}):

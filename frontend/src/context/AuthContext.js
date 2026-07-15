@@ -15,7 +15,10 @@ export function AuthProvider({ children }) {
     }
     api
       .get("/auth/me")
-      .then((r) => setUser(r.data))
+      .then((r) => {
+        // /auth/me returns raw user doc which now includes role/systems/permissions
+        setUser(r.data);
+      })
       .catch(() => {
         localStorage.removeItem("hmc_token");
         localStorage.removeItem("hmc_user");
@@ -34,12 +37,36 @@ export function AuthProvider({ children }) {
   const logout = () => {
     localStorage.removeItem("hmc_token");
     localStorage.removeItem("hmc_user");
+    localStorage.removeItem("hmc_system");
     setUser(null);
     window.location.href = "/login";
   };
 
+  const isOwner = user?.role === "owner";
+  const hasPermission = (perm) => {
+    if (!user) return false;
+    if (user.role === "owner") return true;
+    return !!(user.permissions && user.permissions[perm]);
+  };
+  const canAccessSystem = (sys) => {
+    if (!user) return false;
+    if (user.role === "owner") return true;
+    return (user.systems || []).includes(sys);
+  };
+
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout }}>
+    <AuthContext.Provider
+      value={{
+        user,
+        loading,
+        login,
+        logout,
+        isOwner,
+        hasPermission,
+        canAccessSystem,
+        setUser,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );

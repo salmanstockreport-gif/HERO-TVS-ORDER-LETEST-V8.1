@@ -20,8 +20,15 @@ export default function LoginPage() {
     setError("");
     setLoading(true);
     try {
-      await login(username, password);
-      navigate("/");
+      const data = await login(username, password);
+      const u = data.user;
+      // Auto-pick sole system for single-system employees; else send to selector.
+      if (u.role !== "owner" && Array.isArray(u.systems) && u.systems.length === 1) {
+        localStorage.setItem("hmc_system", u.systems[0]);
+        navigate("/");
+      } else {
+        navigate("/select-system");
+      }
     } catch (err) {
       setError(formatApiError(err.response?.data?.detail) || err.message);
     } finally {
@@ -50,12 +57,12 @@ export default function LoginPage() {
           justifyContent: "flex-end",
         }}
       >
-        <div className="overline mb-4">Kabir Auto Parts · Dealer Portal</div>
+        <div className="overline mb-4">Kabir Auto Parts · Multi-brand Portal</div>
         <h1
           className="font-display"
           style={{ fontSize: "56px", lineHeight: "1.05", fontWeight: 900 }}
         >
-          Hero MotoCorp
+          Hero &amp; TVS
           <br />
           <span style={{ color: "var(--hero-primary)" }}>Parts Ordering</span>
         </h1>
@@ -63,9 +70,9 @@ export default function LoginPage() {
           className="mt-6 max-w-md"
           style={{ color: "var(--hero-muted)", fontSize: "14px" }}
         >
-          Search parts from the Hero eCatalogue, compute landed prices, track
-          current and sent orders, and export ready-to-send Excel &amp; PDF
-          sheets — all in one place.
+          One portal for Hero MotoCorp and TVS Motor parts. Search either
+          eCatalogue, share one inventory sheet, and manage orders with fine
+          employee-level permissions.
         </p>
       </div>
       <div className="login-form-panel"

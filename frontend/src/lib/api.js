@@ -1,4 +1,5 @@
 import axios from "axios";
+import { getStoredSystem } from "@/context/SystemContext";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 export const API = `${BACKEND_URL}/api`;
@@ -7,10 +8,32 @@ const client = axios.create({
   baseURL: API,
 });
 
+// Endpoints scoped by the currently-selected system (hero|tvs). For these,
+// we auto-inject `system=<current>` if the caller didn't already set it.
+const SYSTEM_SCOPED = [
+  /^\/orders(\?|$)/,               // GET /orders, POST /orders (list/create)
+  /^\/orders\/check-part\//,       // check-part-history is per-system
+  /^\/dashboard\//,
+  /^\/important-parts(\?|$)/,
+  /^\/mandatory-parts(\?|$)/,
+  /^\/mandatory-toggle/,
+];
+
 client.interceptors.request.use((config) => {
   const token = localStorage.getItem("hmc_token");
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
+  }
+  const url = config.url || "";
+  const needsSystem = SYSTEM_SCOPED.some((re) => re.test(url));
+  if (needsSystem) {
+    const stored = getStoredSystem();
+    if (stored) {
+      const params = config.params || {};
+      if (params.system === undefined) {
+        config.params = { ...params, system: stored };
+      }
+    }
   }
   return config;
 });

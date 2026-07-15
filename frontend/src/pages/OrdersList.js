@@ -5,12 +5,14 @@ import api from "@/lib/api";
 import { IDS } from "@/lib/testIds";
 import { toast } from "sonner";
 import ConfirmDeleteDialog from "@/components/ConfirmDeleteDialog";
+import { useSystem } from "@/context/SystemContext";
 
 export default function OrdersList({ status }) {
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [pendingDelete, setPendingDelete] = useState(null); // {id, order_no}
   const navigate = useNavigate();
+  const { meta } = useSystem();
 
   const load = () => {
     setLoading(true);
@@ -20,7 +22,7 @@ export default function OrdersList({ status }) {
       .finally(() => setLoading(false));
   };
 
-  useEffect(load, [status]);
+  useEffect(load, [status, meta?.key]);
 
   const confirmDelete = async () => {
     if (!pendingDelete) return;
@@ -36,10 +38,11 @@ export default function OrdersList({ status }) {
   };
 
   const title = status === "current" ? "Current Orders" : "Sent Orders";
+  const brandName = meta?.label || "the vendor";
   const subtitle =
     status === "current"
       ? "Drafts you're still editing before dispatch."
-      : "Orders you've marked as sent to Hero MotoCorp.";
+      : `Orders you've marked as sent to ${brandName}.`;
 
   return (
     <div className="page p-10 max-w-7xl">

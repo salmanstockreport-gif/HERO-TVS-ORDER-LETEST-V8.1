@@ -16,8 +16,9 @@ import {
 import { toast } from "sonner";
 import api, { API, formatApiError } from "@/lib/api";
 import { IDS } from "@/lib/testIds";
-import { formatPartNo, partNoKey } from "@/lib/partNo";
+import { formatPartNo, formatPartNoForSystem, partNoKey } from "@/lib/partNo";
 import ConfirmDeleteDialog from "@/components/ConfirmDeleteDialog";
+import { useSystem } from "@/context/SystemContext";
 
 const emptyItem = () => ({
   part_no: "",
@@ -35,6 +36,9 @@ export default function OrderEditor() {
   const { orderId } = useParams();
   const navigate = useNavigate();
   const isNew = !orderId;
+  const { meta } = useSystem();
+  const searchEndpoint = meta?.searchEndpoint || "/hero/search";
+  const brandName = meta?.label || "the vendor";
 
   const [order, setOrder] = useState(null);
   const [items, setItems] = useState([]);
@@ -184,11 +188,11 @@ export default function OrderEditor() {
     setManualOpen(false);
     try {
       const { data } = await api.get(
-        `/hero/search?q=${encodeURIComponent(q)}`,
+        `${searchEndpoint}?q=${encodeURIComponent(q)}`,
       );
       if (!data.parts || data.parts.length === 0) {
         setSearchError(
-          `No parts found for "${q}" in the Hero eCatalogue. You can add it manually below.`,
+          `No parts found for "${q}" in the ${brandName} eCatalogue. You can add it manually below.`,
         );
         setManualForm((f) => ({ ...f, part_no: q, description: "", mrp: 0, moq: "", qty: 1 }));
         setManualOpen(true);
@@ -201,7 +205,7 @@ export default function OrderEditor() {
     } catch (err) {
       setSearchError(
         formatApiError(err.response?.data?.detail) ||
-          "Hero eCatalogue unreachable. You can still add the part manually below.",
+          `${brandName} eCatalogue unreachable. You can still add the part manually below.`,
       );
       setManualForm((f) => ({ ...f, part_no: q }));
       setManualOpen(true);
@@ -229,7 +233,7 @@ export default function OrderEditor() {
       toast.error("Part number is required");
       return;
     }
-    const pn = formatPartNo(raw);
+    const pn = formatPartNoForSystem(raw, meta?.key);
     const norm = partNoKey(pn);
     if (items.some((it) => partNoKey(it.part_no) === norm)) {
       toast.error(`Duplicate: ${pn} is already in this order.`);
@@ -279,7 +283,7 @@ export default function OrderEditor() {
   };
 
   const addPart = (part, qtyOverride) => {
-    const formatted = formatPartNo(part.part_no);
+    const formatted = formatPartNoForSystem(part.part_no, meta?.key);
     const norm = partNoKey(formatted);
     const exists = items.some(
       (it) => partNoKey(it.part_no) === norm,
@@ -601,7 +605,7 @@ export default function OrderEditor() {
       {/* Search bar */}
       {!readonly && (
         <div className="card p-5 mb-6">
-          <div className="overline mb-3">Add part from Hero eCatalogue</div>
+          <div className="overline mb-3">Add part from {brandName} eCatalogue</div>
           <div className="flex gap-2 flex-wrap">
             <div className="relative" style={{ flex: "1 1 220px", minWidth: 200 }}>
               <input
@@ -849,7 +853,7 @@ export default function OrderEditor() {
                 <tbody>
                   {searchResults.map((p) => {
                     const landed = +(p.mrp * (1 - globalDiscount / 100)).toFixed(2);
-                    const formatted = formatPartNo(p.part_no);
+                    const formatted = formatPartNoForSystem(p.part_no, meta?.key);
                     const qtyVal = addQty[p.part_no] ?? (p.moq || 1);
                     const setQ = (v) =>
                       setAddQty((prev) => ({ ...prev, [p.part_no]: v }));
@@ -953,7 +957,7 @@ export default function OrderEditor() {
             className="p-16 text-center text-sm"
             style={{ color: "var(--hero-muted)" }}
           >
-            No parts added yet. Search above to add parts from the Hero eCatalogue.
+            No parts added yet. Search above to add parts from the {brandName} eCatalogue.
           </div>
         ) : (
           <div className="table-scroll">

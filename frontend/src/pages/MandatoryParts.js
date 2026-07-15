@@ -3,12 +3,14 @@ import { toast } from "sonner";
 import { PushPin, Plus, Trash, Info } from "@phosphor-icons/react";
 import api, { formatApiError } from "@/lib/api";
 import { IDS } from "@/lib/testIds";
+import { useSystem } from "@/context/SystemContext";
 
 export default function MandatoryParts() {
   const [items, setItems] = useState([]);
   const [enabled, setEnabled] = useState(false);
   const [form, setForm] = useState({ part_no: "", description: "", mrp: 0, qty: 1 });
   const [saving, setSaving] = useState(false);
+  const { meta } = useSystem();
 
   const load = () =>
     api.get("/mandatory-parts").then((r) => {
@@ -18,7 +20,7 @@ export default function MandatoryParts() {
 
   useEffect(() => {
     load();
-  }, []);
+  }, [meta?.key]);
 
   const toggleEnabled = async (val) => {
     setEnabled(val); // optimistic

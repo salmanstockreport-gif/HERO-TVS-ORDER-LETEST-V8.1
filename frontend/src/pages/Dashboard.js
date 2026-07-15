@@ -14,6 +14,7 @@ import {
 import { toast } from "sonner";
 import api from "@/lib/api";
 import { IDS } from "@/lib/testIds";
+import { useSystem } from "@/context/SystemContext";
 
 const Stat = ({ label, value, icon: Icon, accent = false, testId, href }) => (
   <Link
@@ -49,11 +50,14 @@ export default function Dashboard() {
   const [stats, setStats] = useState(null);
   const [recentOrders, setRecentOrders] = useState([]);
   const navigate = useNavigate();
+  const { meta } = useSystem();
 
   useEffect(() => {
+    setStats(null);
+    setRecentOrders([]);
     api.get("/dashboard/stats").then((r) => setStats(r.data));
     api.get("/orders").then((r) => setRecentOrders(r.data.slice(0, 6)));
-  }, []);
+  }, [meta?.key]);
 
   const lowStock = stats?.low_stock_alerts || [];
   const ordersFull = !!stats?.current_orders_full;
@@ -73,7 +77,7 @@ export default function Dashboard() {
     <div data-testid={IDS.dashboardPage} className="page p-10 max-w-7xl">
       <div className="flex items-end justify-between mb-10 gap-3 flex-wrap actions-row">
         <div>
-          <div className="overline mb-2">Overview</div>
+          <div className="overline mb-2">{meta?.label || "Overview"}</div>
           <h1 className="font-display font-bold text-4xl page-title">Dashboard</h1>
         </div>
         <Link
@@ -101,7 +105,7 @@ export default function Dashboard() {
         >
           <Lock size={16} weight="fill" />
           <div style={{ flex: 1 }}>
-            <b>New orders locked.</b> You already have {stats?.current_orders} current orders (limit {ordersLimit}). Send one to Hero or delete it before starting a new one.
+            <b>New orders locked.</b> You already have {stats?.current_orders} current orders (limit {ordersLimit}). Send one to {meta?.label || "the vendor"} or delete it before starting a new one.
           </div>
           <Link
             to="/orders/current"

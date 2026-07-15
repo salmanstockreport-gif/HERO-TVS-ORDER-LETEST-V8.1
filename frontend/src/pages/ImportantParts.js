@@ -3,18 +3,20 @@ import { toast } from "sonner";
 import { Star, Plus, Trash, Warning } from "@phosphor-icons/react";
 import api, { formatApiError } from "@/lib/api";
 import { IDS } from "@/lib/testIds";
+import { useSystem } from "@/context/SystemContext";
 
 export default function ImportantParts() {
   const [items, setItems] = useState([]);
   const [form, setForm] = useState({ part_no: "", description: "", threshold_qty: 1 });
   const [saving, setSaving] = useState(false);
+  const { meta } = useSystem();
 
   const load = () =>
     api.get("/important-parts").then((r) => setItems(r.data));
 
   useEffect(() => {
     load();
-  }, []);
+  }, [meta?.key]);
 
   const add = async () => {
     if (!form.part_no.trim()) return toast.error("Part number is required");
