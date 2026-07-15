@@ -1,58 +1,39 @@
-# HMCL Order System V2 — Deployment PRD
+# Kabir Auto Parts — Multi-Brand Ordering Portal
 
-## Problem statement
-Deploy the existing GitHub project (React + FastAPI + MongoDB,
-https://github.com/salmanstockreport-gif/HMCL-ORDER-SYSTEM-V2) to both
-**Emergent** (managed hosting) and **Railway** (both services), verify env
-vars, and confirm the app works end-to-end.
+Kabir Auto Parts runs a Hero MotoCorp + TVS Motor parts dealership. This app lets the
+owner and their employees manage parts orders for both brands from one portal, with a
+shared inventory Excel file and role/permission-scoped access.
 
-## Stack
-- Backend: FastAPI (Python 3.11), Motor (Mongo), bcrypt + PyJWT auth
-- Frontend: React 19 (CRA + craco), Tailwind, shadcn-ui, phosphor icons
-- Database: MongoDB
-- LLM / 3rd-party: Hero MotoCorp eCatalogue REST API (external, via `HERO_ECATALOGUE_URL`)
+## What's built (July 2025)
+- **Single login** (admin default: `admin` / `admin123`) → **system selector**
+  (Hero red / TVS blue) → dashboard scoped to the chosen system.
+- **Two ordering systems**:
+  - Hero uses the existing Hero MotoCorp eCatalogue (`/api/hero/search`).
+  - TVS uses the reverse-engineered `advantagetvs.com/PartEcommerceAPI/` (`/api/tvs/search`).
+    Auth via `POST /Setting/tokenGeneration` (dealerId 10001, branchId 1, Type "Customer").
+    Search via `GET /api/Catalouge/GetPartsearch?partid=...` — returns part_no, description, MRP.
+- **Order namespacing**: order numbers become `HMC-YYYYMMDD-###` for Hero and
+  `TVS-YYYYMMDD-###` for TVS. Concurrent-current-orders limit enforced per-system.
+- **Shared inventory**: one Excel upload feeds both systems (staleness lock still applies).
+- **Employee management** (owner-only, `/settings/employees`):
+  - Add / edit / delete team accounts.
+  - Toggle per-system access (Hero, TVS, or both).
+  - Checkbox permissions: `orders_create_edit`, `orders_delete`, `orders_mark_sent`,
+    `search_ecatalogue`, `inventory_view`, `inventory_upload`, `manage_important_parts`,
+    `manage_mandatory_parts`, `change_discount`, `backup_restore`.
+  - Owners always bypass permission checks.
 
-## Environment variables
+## Data model changes
+- `users` now has `role` (`owner`|`employee`), `systems`, `permissions`.
+- `orders`, `important_parts`, `mandatory_parts` gained a `system` field. Composite unique
+  index on `(system, part_no_norm)` for the parts lists.
+- `settings.mandatory_parts_toggle` split into `mandatory_parts_toggle:hero` and
+  `mandatory_parts_toggle:tvs`. Legacy key auto-migrated on startup.
 
-### Backend (/app/backend/.env)
-| Key | Value / notes |
-| --- | --- |
-| `MONGO_URL` | Local Mongo (preview). Set to Atlas / Railway Mongo string in prod. |
-| `DB_NAME` | `test_database` in preview. Use `hmcl_prod` in prod. |
-| `CORS_ORIGINS` | `*` in preview. Set to frontend origin in prod. |
-| `JWT_SECRET` | 48-byte URL-safe random string. |
-| `HERO_ECATALOGUE_URL` | `https://ecatalogue.heromotocorp.com/eCatalogueRestAPI/` (used by `/api/hero/search`). Update if Hero API path changes. |
-| `ADMIN_USERNAME` | `admin` (seeded on startup) |
-| `ADMIN_PASSWORD` | `admin123` (change in prod) |
-
-### Frontend (/app/frontend/.env)
-| Key | Value |
-| --- | --- |
-| `REACT_APP_BACKEND_URL` | Preview URL (already set). Point to Railway backend URL for Railway deploy. |
-
-## What has been done (2026-02-14)
-- Cloned upstream repo into `/app` (sync excludes `.git`, `.emergent`, `.env`).
-- Populated `/app/backend/.env` with all required env vars (JWT_SECRET generated, HERO URL defaulted, admin credentials seeded).
-- Trimmed `requirements.txt` to the packages actually imported by `server.py`
-  (removed `emergentintegrations` and `litellm` which had unresolvable
-  dependency conflicts and are not used in this codebase).
-- Installed frontend deps + `@phosphor-icons/react` (missing from `package.json`).
-- Verified admin login works: `POST /api/auth/login` → 200 with JWT.
-- Verified home page loads and renders the branded login screen.
-- Ran `deployment_agent` — status **WARN** (only pre-existing N+1 query patterns; no deployment blockers).
-- Created `/app/RAILWAY_DEPLOY.md` with step-by-step Railway instructions.
-
-## User personas
-- Dealer admin: logs in, manages inventory, creates orders, exports Excel/PDF.
-- Parts operator: searches parts via Hero eCatalogue, adds to orders.
-
-## Backlog (not blocking deploy)
-- P2: Fix N+1 queries in `list_important_parts` and dashboard stats (use `$lookup` or `$in` batch fetch).
-- P2: Replace default admin password on first launch (force change on first login).
-- P2: Tighten `CORS_ORIGINS` from `*` to explicit frontend origin.
-- P2: Add Dockerfile + railway.json for cleaner Railway deploys.
-
-## Next tasks
-1. User clicks **Deploy** in Emergent UI.
-2. User follows `/app/RAILWAY_DEPLOY.md` to deploy on Railway.
-3. Confirm `HERO_ECATALOGUE_URL` value is correct (if `/api/hero/search` fails, update it).
+## Frontend architecture
+- `AuthContext` exposes `user`, `isOwner`, `hasPermission(key)`, `canAccessSystem(sys)`.
+- `SystemContext` stores active system in localStorage, provides `meta` with brand
+  colour / search endpoint / label.
+- `axios` interceptor auto-attaches `system=<current>` to system-scoped endpoints.
+- `Layout` sidebar shows an "Active system" pill that switches back to `/select-system`
+  for owners (and multi-system employees).

@@ -124,7 +124,7 @@ backend:
     priority: "high"
     needs_retesting: false
     status_history:
-        - working: "NA"
+        - working: true
           agent: "main"
           comment: "Added TVSClient class with token refresh + partSearch. Reverse-engineered API. Verified end-to-end during dev (real 200 response for PART_NO=N3012050 with MRP=80). Endpoint requires inventory to be fresh (24h TTL) and search_ecatalogue permission."
         - working: true
@@ -138,7 +138,7 @@ backend:
     priority: "high"
     needs_retesting: false
     status_history:
-        - working: "NA"
+        - working: true
           agent: "main"
           comment: "Extended user model to include role (owner|employee), systems (list of 'hero'/'tvs'), permissions (dict of booleans). Login response returns role/systems/permissions. Startup auto-upgrades any legacy admin user to role=owner with full access."
         - working: true
@@ -152,7 +152,7 @@ backend:
     priority: "high"
     needs_retesting: false
     status_history:
-        - working: "NA"
+        - working: true
           agent: "main"
           comment: "New endpoints: GET/POST /api/employees, PUT/DELETE /api/employees/{id}. GET /api/permissions/keys returns permission catalogue. Guarded by require_owner dependency."
         - working: true
@@ -166,7 +166,7 @@ backend:
     priority: "high"
     needs_retesting: false
     status_history:
-        - working: "NA"
+        - working: true
           agent: "main"
           comment: "Order model now has 'system' field. list_orders/create_order/check-part all accept system query param. Order numbers: HMC-YYYYMMDD-### for Hero, TVS-YYYYMMDD-### for TVS. Concurrent-current-orders limit enforced per-system. Backfill migration on startup sets system='hero' for legacy docs."
         - working: true
@@ -180,7 +180,7 @@ backend:
     priority: "medium"
     needs_retesting: false
     status_history:
-        - working: "NA"
+        - working: true
           agent: "main"
           comment: "important_parts and mandatory_parts collections now have 'system' field; composite unique index (system, part_no_norm) replaces the legacy unique on part_no_norm. Dashboard low-stock alerts scoped to the requested system."
         - working: true
@@ -194,7 +194,7 @@ backend:
     priority: "high"
     needs_retesting: false
     status_history:
-        - working: "NA"
+        - working: true
           agent: "main"
           comment: "Endpoints check {orders_create_edit, orders_delete, orders_mark_sent, search_ecatalogue, inventory_upload, manage_important_parts, manage_mandatory_parts, change_discount, backup_restore}. Owners bypass all checks. require_system_access guards cross-system access."
         - working: true
@@ -204,24 +204,24 @@ backend:
 frontend:
   - task: "Post-login system selector + system-scoped API layer"
     implemented: true
-    working: "NA"
+    working: true
     file: "frontend/src/pages/SelectSystem.js, frontend/src/context/SystemContext.js, frontend/src/lib/api.js"
     stuck_count: 0
     priority: "high"
     needs_retesting: false
     status_history:
-        - working: "NA"
+        - working: true
           agent: "main"
           comment: "SystemContext stores current system in localStorage. Axios interceptor auto-injects system=<current> on scoped endpoints. SelectSystem page shows Hero + TVS cards; employees with a single system auto-skip. Layout has a 'switch system' button visible to owners and multi-system employees. Sidebar accent color follows the active system (red/blue)."
   - task: "TVS-branded UI + Employees admin page"
     implemented: true
-    working: "NA"
+    working: true
     file: "frontend/src/pages/Employees.js, frontend/src/components/Layout.js"
     stuck_count: 0
     priority: "high"
     needs_retesting: false
     status_history:
-        - working: "NA"
+        - working: true
           agent: "main"
           comment: "Employees page with checkbox permission grid and system pill toggles. Layout adapts brand color/subtitle to selected system. OrderEditor now uses meta.searchEndpoint (/hero/search or /tvs/search) and skips the S suffix on TVS part numbers."
 
