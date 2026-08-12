@@ -10,7 +10,7 @@ import pytest
 import requests
 import pandas as pd
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL") or "https://mc-hmcl.preview.emergentagent.com"
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL") or "https://instant-ship-7.preview.emergentagent.com"
 BASE_URL = BASE_URL.rstrip("/")
 API = f"{BASE_URL}/api"
 

@@ -10,7 +10,7 @@ import sys
 from openpyxl import Workbook
 
 # Backend URL from frontend/.env
-BASE_URL = "https://008a5671-c16f-4b24-91b3-151477b7ed8b.preview.emergentagent.com/api"
+BASE_URL = "https://instant-ship-7.preview.emergentagent.com/api"
 
 # Test credentials
 OWNER_USERNAME = "admin"
