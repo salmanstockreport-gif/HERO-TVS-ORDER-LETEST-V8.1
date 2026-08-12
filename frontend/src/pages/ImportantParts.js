@@ -1,15 +1,19 @@
 import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { Star, Plus, Trash, Warning } from "@phosphor-icons/react";
+import { Star, Plus, Trash, Warning, ShoppingCart } from "@phosphor-icons/react";
 import api, { formatApiError } from "@/lib/api";
 import { IDS } from "@/lib/testIds";
 import { useSystem } from "@/context/SystemContext";
+import AddToOrderDialog from "@/components/AddToOrderDialog";
 
 export default function ImportantParts() {
   const [items, setItems] = useState([]);
   const [form, setForm] = useState({ part_no: "", description: "", threshold_qty: 1 });
   const [saving, setSaving] = useState(false);
+  const [addToOrderPart, setAddToOrderPart] = useState(null);
   const { meta } = useSystem();
+  const navigate = useNavigate();
 
   const load = () =>
     api.get("/important-parts").then((r) => setItems(r.data));
@@ -215,14 +219,33 @@ export default function ImportantParts() {
                       )}
                     </td>
                     <td className="center">
-                      <button
-                        className="btn btn-ghost"
-                        style={{ padding: "4px 6px", color: "#f87171" }}
-                        onClick={() => remove(it.id)}
-                        data-testid={`important-remove-${it.id}`}
-                      >
-                        <Trash size={12} />
-                      </button>
+                      <div className="flex items-center gap-1 justify-center">
+                        <button
+                          className={`btn ${it.is_low ? "btn-primary" : "btn-outline"}`}
+                          style={{ padding: "4px 8px", fontSize: "11px" }}
+                          onClick={() =>
+                            setAddToOrderPart({
+                              part_no: it.part_no,
+                              description: it.description || "",
+                              mrp: 0,
+                              qty: 1,
+                            })
+                          }
+                          data-testid={`important-addtoorder-${it.id}`}
+                          title="Add this part to a current order"
+                        >
+                          <ShoppingCart size={12} />
+                          Add to order
+                        </button>
+                        <button
+                          className="btn btn-ghost"
+                          style={{ padding: "4px 6px", color: "#f87171" }}
+                          onClick={() => remove(it.id)}
+                          data-testid={`important-remove-${it.id}`}
+                        >
+                          <Trash size={12} />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -231,6 +254,17 @@ export default function ImportantParts() {
           </div>
         )}
       </div>
+
+      {addToOrderPart && (
+        <AddToOrderDialog
+          part={addToOrderPart}
+          onClose={() => setAddToOrderPart(null)}
+          onDone={(orderId) => {
+            setAddToOrderPart(null);
+            if (orderId) navigate(`/orders/${orderId}`);
+          }}
+        />
+      )}
     </div>
   );
 }
