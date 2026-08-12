@@ -13,9 +13,12 @@ import {
 import api, { formatApiError, API } from "@/lib/api";
 import { IDS } from "@/lib/testIds";
 import { useAuth } from "@/context/AuthContext";
+import { useSystem } from "@/context/SystemContext";
 
 export default function Settings() {
   const { user } = useAuth();
+  const { meta } = useSystem();
+  const brandName = meta?.label || "this system";
   const [discount, setDiscount] = useState(0);
   const [saving, setSaving] = useState(false);
 
@@ -37,7 +40,7 @@ export default function Settings() {
     api.get("/settings").then((r) =>
       setDiscount(Number(r.data.discount_percent || 0)),
     );
-  }, []);
+  }, [meta?.key]);
 
   useEffect(() => {
     if (user?.username) {
@@ -49,7 +52,7 @@ export default function Settings() {
     setSaving(true);
     try {
       await api.put("/settings/discount", { discount_percent: Number(discount) });
-      toast.success("Global discount saved");
+      toast.success(`${brandName} DLP / discount saved`);
     } catch (e) {
       toast.error(formatApiError(e.response?.data?.detail) || e.message);
     } finally {
@@ -184,15 +187,17 @@ export default function Settings() {
         <div className="flex items-center gap-3 mb-1">
           <Percent size={16} color="var(--hero-primary)" />
           <div className="font-display text-lg font-semibold">
-            Global Discount
+            {brandName} DLP / Discount
           </div>
         </div>
         <p
           className="text-xs mb-6"
           style={{ color: "var(--hero-muted)" }}
         >
-          Applied by default to every part you add. Landed Price = MRP × (1 −
-          discount / 100). You can still override per line-item inside an order.
+          This DLP (discount) applies only to <b>{brandName}</b> — Hero and TVS
+          each keep their own separate value. Applied by default to every part
+          you add. Landed Price = MRP × (1 − discount / 100). You can still
+          override per line-item inside an order.
         </p>
 
         <div className="flex items-end gap-3 flex-wrap">
@@ -250,7 +255,7 @@ export default function Settings() {
           className="text-xs mb-6"
           style={{ color: "var(--hero-muted)" }}
         >
-          Change your login username and/or password. You'll be signed out and
+          Change your login username and/or password. You&apos;ll be signed out and
           asked to sign in again with the new details.
         </p>
 

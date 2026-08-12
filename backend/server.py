@@ -339,6 +339,11 @@ class MandatoryPartBody(BaseModel):
     description: str = ""
     mrp: float = 0.0
     qty: int = 1
+    threshold_qty: float = 0
+
+
+class AddItemsBody(BaseModel):
+    items: List[OrderItem] = []
 
 
 class MandatoryToggleBody(BaseModel):
@@ -421,6 +426,18 @@ def compute_item_totals(item: dict, global_discount: float) -> dict:
     item["landed_price"] = landed
     item["line_total"] = line_total
     return item
+
+
+async def get_system_discount(system: str = "hero") -> float:
+    """Return the discount/DLP percentage for a given system (hero|tvs).
+    Falls back to the legacy shared 'discount_percent' when a per-system value
+    has not been set yet."""
+    settings = await db.settings.find_one({"key": "global"}) or {}
+    key = f"discount_percent_{system}"
+    val = settings.get(key)
+    if val is None:
+        val = settings.get("discount_percent")
+    return float(val or 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -563,25 +580,42 @@ async def change_credentials(body: CredentialsUpdate, current_user: dict = Depen
 # Settings
 # ---------------------------------------------------------------------------
 @api_router.get("/settings")
-async def get_settings(current_user: dict = Depends(get_current_user)):
+async def get_settings(system: str = "hero", current_user: dict = Depends(get_current_user)):
     settings = await db.settings.find_one({"key": "global"}, {"_id": 0})
     if not settings:
         settings = {"key": "global", "discount_percent": 0.0}
+    legacy = float(settings.get("discount_percent") or 0.0)
+    hero_d = settings.get("discount_percent_hero")
+    tvs_d = settings.get("discount_percent_tvs")
+    hero_d = float(hero_d) if hero_d is not None else legacy
+    tvs_d = float(tvs_d) if tvs_d is not None else legacy
+    settings["discount_percent_hero"] = hero_d
+    settings["discount_percent_tvs"] = tvs_d
+    # `discount_percent` reflects the requested system so existing callers work.
+    settings["discount_percent"] = hero_d if system == "hero" else tvs_d
+    settings["system"] = system
     return settings
 
 
 @api_router.put("/settings/discount")
-async def update_discount(body: DiscountUpdate, current_user: dict = Depends(get_current_user)):
+async def update_discount(
+    body: DiscountUpdate,
+    system: str = "hero",
+    current_user: dict = Depends(get_current_user),
+):
     if not is_owner(current_user) and not current_user.get("permissions", {}).get("change_discount"):
         raise HTTPException(status_code=403, detail="Missing permission: change_discount")
     if body.discount_percent < 0 or body.discount_percent > 100:
         raise HTTPException(status_code=400, detail="Discount must be between 0 and 100")
+    if system not in ("hero", "tvs"):
+        system = "hero"
+    field = f"discount_percent_{system}"
     await db.settings.update_one(
         {"key": "global"},
-        {"$set": {"discount_percent": body.discount_percent, "updated_at": now_iso()}},
+        {"$set": {field: body.discount_percent, "updated_at": now_iso()}},
         upsert=True,
     )
-    return {"discount_percent": body.discount_percent}
+    return {"discount_percent": body.discount_percent, "system": system}
 
 
 # ---------------------------------------------------------------------------
@@ -760,8 +794,7 @@ async def create_order(
         raise HTTPException(status_code=403, detail="Missing permission: orders_create_edit")
     await _ensure_current_orders_limit(system)
 
-    settings = await db.settings.find_one({"key": "global"}) or {}
-    global_discount = float(settings.get("discount_percent") or 0.0)
+    global_discount = await get_system_discount(system)
     items = await _resolve_new_order_items(body.items or [], global_discount, system)
 
     order = {
@@ -793,8 +826,7 @@ async def update_order(order_id: str, body: OrderUpdate, current_user: dict = De
     if order.get("status") == "sent":
         raise HTTPException(status_code=400, detail="Cannot edit a sent order")
 
-    settings = await db.settings.find_one({"key": "global"}) or {}
-    global_discount = float(settings.get("discount_percent") or 0.0)
+    global_discount = await get_system_discount(order.get("system", "hero"))
 
     items = []
     seen = set()
@@ -818,6 +850,45 @@ async def update_order(order_id: str, body: OrderUpdate, current_user: dict = De
     )
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
     return updated
+
+
+@api_router.post("/orders/{order_id}/add-items")
+async def add_items_to_order(
+    order_id: str,
+    body: AddItemsBody,
+    current_user: dict = Depends(require_fresh_inventory),
+):
+    """Append one or more parts to an existing draft order (used by the
+    'Add to order' action on low-stock mandatory parts). Skips duplicates."""
+    order = await db.orders.find_one({"id": order_id})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    require_system_access(current_user, order.get("system", "hero"))
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("orders_create_edit"):
+        raise HTTPException(status_code=403, detail="Missing permission: orders_create_edit")
+    if order.get("status") == "sent":
+        raise HTTPException(status_code=400, detail="Cannot edit a sent order")
+
+    global_discount = await get_system_discount(order.get("system", "hero"))
+    items = list(order.get("items", []))
+    seen = {normalize_part_no(i.get("part_no", "")) for i in items}
+    added = 0
+    for it in body.items:
+        d = it.model_dump()
+        norm = normalize_part_no(d["part_no"])
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        compute_item_totals(d, global_discount)
+        items.append(d)
+        added += 1
+
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {"items": items, "updated_at": now_iso()}},
+    )
+    updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    return {"order": updated, "added": added}
 
 
 @api_router.post("/orders/{order_id}/mark-sent")
@@ -1414,6 +1485,20 @@ async def list_mandatory_parts(
 ):
     require_system_access(current_user, system)
     docs = await db.mandatory_parts.find({"system": system}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    # Join inventory to expose current stock + low-stock flag (like important parts).
+    norms = [d.get("part_no_norm") for d in docs if d.get("part_no_norm")]
+    inv_map: Dict[str, dict] = {}
+    if norms:
+        async for inv in db.inventory.find(
+            {"part_no_norm": {"$in": norms}}, {"_id": 0, "part_no_norm": 1, "stock_qty": 1}
+        ):
+            inv_map[inv["part_no_norm"]] = inv
+    for d in docs:
+        inv = inv_map.get(d.get("part_no_norm"))
+        d["current_stock"] = float(inv["stock_qty"]) if inv else 0.0
+        thr = float(d.get("threshold_qty") or 0)
+        d["threshold_qty"] = thr
+        d["is_low"] = thr > 0 and d["current_stock"] < thr
     toggle = await db.settings.find_one({"key": f"mandatory_parts_toggle:{system}"}) or {}
     return {"parts": docs, "enabled": bool(toggle.get("enabled", False))}
 
@@ -1443,6 +1528,7 @@ async def add_mandatory_part(
         "description": body.description or "",
         "mrp": float(body.mrp or 0),
         "qty": int(body.qty or 1),
+        "threshold_qty": float(body.threshold_qty or 0),
         "created_at": now_iso(),
     }
     await db.mandatory_parts.insert_one(doc)
@@ -1462,6 +1548,7 @@ async def update_mandatory_part(item_id: str, body: MandatoryPartBody, current_u
         "description": body.description or "",
         "mrp": float(body.mrp or 0),
         "qty": int(body.qty or 1),
+        "threshold_qty": float(body.threshold_qty or 0),
         "updated_at": now_iso(),
     }
     await db.mandatory_parts.update_one({"id": item_id}, {"$set": updates})

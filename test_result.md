@@ -116,7 +116,49 @@ user_problem_statement: |
      - Returns part_no, description, MRP from top result.
 
 backend:
-  - task: "Hero eCatalogue URL migration (bug fix)"
+  - task: "Per-system DLP / discount (Hero vs TVS separate)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Split the single global discount into per-system values stored in the 'global' settings doc as discount_percent_hero and discount_percent_tvs (legacy discount_percent used as fallback). GET /api/settings?system=hero|tvs now returns discount_percent for that system plus discount_percent_hero/tvs. PUT /api/settings/discount?system=hero|tvs sets only that system's value. create_order & update_order and the new add-items endpoint use get_system_discount(system) so Hero and TVS landed prices are computed with their own DLP. Please verify: setting Hero DLP=25 and TVS DLP=10 keeps them independent, and orders compute landed price using the matching system DLP."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED - Per-system DLP working perfectly. Test results: (1) PUT /api/settings/discount?system=hero with discount_percent=25 returns 200 with discount_percent=25, system='hero'. (2) PUT /api/settings/discount?system=tvs with discount_percent=10 returns 200 with discount_percent=10, system='tvs'. (3) GET /api/settings?system=hero returns discount_percent=25.0, discount_percent_hero=25.0, discount_percent_tvs=10.0 - all correct. (4) GET /api/settings?system=tvs returns discount_percent=10.0, discount_percent_hero=25.0, discount_percent_tvs=10.0 - all correct. (5) Independence verified: Changed Hero DLP to 30%, TVS remained at 10% (discount_percent_hero=30.0, discount_percent_tvs=10.0). The two systems are completely independent. Hero and TVS DLPs are stored and retrieved separately as expected."
+  - task: "Add parts to an existing order (POST /api/orders/{id}/add-items)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "New endpoint appends one or more items to an existing draft order, dedupes by normalized part_no, computes line totals with the order's system DLP, and rejects sent orders (400). Requires orders_create_edit permission and fresh inventory. Returns {order, added}. Used by the 'Add to order' action on low-stock mandatory parts."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED - Add-items endpoint working correctly. Test results: (1) POST /api/orders/{id}/add-items with items=[{part_no:'TESTPART1', description:'Test Part 1', mrp:100, qty:2}] to Hero draft order returns 200 with added=1, and the item is appended to order with correct Hero DLP (discount_percent=25%, landed_price=75.0). (2) Posting the same part again returns 200 with added=0 (dedupe by normalized part_no working correctly). (3) After marking order as sent, POST /api/orders/{id}/add-items returns 400 'Cannot edit a sent order' as expected. All three test cases passed. The endpoint correctly computes landed_price using the order's system DLP, deduplicates by normalized part_no, and rejects edits to sent orders."
+  - task: "Mandatory parts reorder threshold + low-stock flag"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "MandatoryPartBody now accepts threshold_qty (default 0 = no alert). add/update persist it. GET /api/mandatory-parts joins inventory and returns current_stock and is_low (is_low = threshold_qty>0 AND current_stock<threshold_qty) for each part, plus the existing enabled flag. Please verify a mandatory part with threshold above its inventory stock reports is_low=true, and threshold_qty=0 never flags low."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED - Mandatory parts threshold and low-stock flag working correctly. Test results: (1) POST /api/mandatory-parts?system=hero with {part_no:'MANDLOW1', description:'Mandatory Low Stock Part', mrp:50, qty:1, threshold_qty:999} returns 200 and creates part with threshold_qty=999.0. (2) GET /api/mandatory-parts?system=hero returns the part with current_stock=1.0, threshold_qty=999.0, is_low=true (correctly flagged as low since stock 1 < threshold 999). (3) POST /api/mandatory-parts?system=hero with {part_no:'MANDOK1', description:'Mandatory OK Stock Part', mrp:75, qty:1, threshold_qty:0} returns 200 and creates part with threshold_qty=0.0. (4) GET /api/mandatory-parts?system=hero returns the part with current_stock=500.0, threshold_qty=0.0, is_low=false (correctly NOT flagged as low since threshold_qty=0). The is_low calculation logic is working perfectly: is_low = (threshold_qty > 0 AND current_stock < threshold_qty)."
+
     implemented: true
     working: true
     file: "backend/.env, RAILWAY_DEPLOY.md"
@@ -243,23 +285,36 @@ frontend:
 metadata:
   created_by: "main_agent"
   version: "2.0"
-  test_sequence: 1
+  test_sequence: 2
   run_ui: false
 
 test_plan:
-  current_focus:
-    - "TVS eCatalogue integration (GET /api/tvs/search)"
-    - "Users with roles/systems/permissions + owner seed migration"
-    - "Employee CRUD (owner-only)"
-    - "System-scoped orders (hero/tvs)"
-    - "Permission gating on mutating endpoints"
-    - "Important & Mandatory parts system-scoped"
+  current_focus: []
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
 
 agent_communication:
     - agent: "main"
+      message: |
+        NEW FEATURE ROUND (July 2025). Please test ONLY these backend changes (admin/admin123):
+        1) Per-system DLP: PUT /api/settings/discount?system=hero {discount_percent:25} then
+           PUT /api/settings/discount?system=tvs {discount_percent:10}. GET /api/settings?system=hero
+           must return discount_percent=25 and discount_percent_hero=25, discount_percent_tvs=10;
+           GET /api/settings?system=tvs returns discount_percent=10. Confirm they are independent.
+        2) Create a Hero order (may need fresh inventory upload first) and confirm items' discount_percent
+           defaults to the Hero DLP; create a TVS order and confirm it uses the TVS DLP.
+        3) add-items: create a draft order, POST /api/orders/{id}/add-items {items:[{part_no,description,mrp,qty}]}
+           -> returns added=1 and the item is appended with landed_price computed from that system's DLP.
+           Posting the same part again returns added=0 (dedupe). Posting to a sent order returns 400.
+        4) Mandatory threshold: POST /api/mandatory-parts {part_no, threshold_qty:999} then
+           GET /api/mandatory-parts -> that part has is_low=true (since stock < 999). A part with
+           threshold_qty=0 must have is_low=false. Inventory freshness gate may require a small
+           inventory upload first (see prior notes below).
+        NOTE: local DB is fresh/empty — upload a tiny inventory (POST /api/inventory/upload) so the
+        24h freshness gate passes before creating orders / add-items.
+
+
       message: |
         Backend expansion is done and self-tested via curl for the TVS API path.
         For the deep_testing_backend_v2 run: please cover
@@ -348,3 +403,46 @@ agent_communication:
         
         CONCLUSION: The Hero eCatalogue URL migration bug fix is WORKING. The previous "origin web server returned an invalid or incomplete response to Cloudflare" error is resolved. Hero searches now successfully connect to the new endpoint and return correct part data.
         NO CRITICAL ISSUES FOUND. Backend is production-ready.
+    - agent: "testing"
+      message: |
+        ✅ NEW FEATURES TESTING COMPLETE - ALL TESTS PASSED (100% success rate)
+        
+        Tested 3 new backend features for Hero/TVS parts ordering app. All features working correctly.
+        
+        Test Summary:
+        
+        1. ✅ PER-SYSTEM DLP / DISCOUNT (Hero vs TVS separate) - 6 sub-tests, all passed
+           - PUT /api/settings/discount?system=hero with discount_percent=25 → 200 OK
+           - PUT /api/settings/discount?system=tvs with discount_percent=10 → 200 OK
+           - GET /api/settings?system=hero returns discount_percent=25, discount_percent_hero=25, discount_percent_tvs=10 ✓
+           - GET /api/settings?system=tvs returns discount_percent=10, discount_percent_hero=25, discount_percent_tvs=10 ✓
+           - Independence verified: Changed Hero to 30%, TVS remained at 10% ✓
+           - Systems are completely independent ✓
+        
+        2. ✅ ORDER USES SYSTEM DLP - 2 sub-tests, all passed
+           - Hero order with item (MRP=100): discount_percent=25%, landed_price=75.0, line_total=150.0 ✓
+           - TVS order with item (MRP=100): discount_percent=10%, landed_price=90.0, line_total=180.0 ✓
+           - Orders correctly use their system's DLP for price calculations ✓
+        
+        3. ✅ ADD-ITEMS ENDPOINT (POST /api/orders/{id}/add-items) - 4 sub-tests, all passed
+           - Add item to Hero draft order: added=1, item appended with Hero DLP (25%) ✓
+           - Add same part again: added=0 (dedupe by normalized part_no working) ✓
+           - Mark order as sent: 200 OK ✓
+           - Try adding items to sent order: 400 "Cannot edit a sent order" ✓
+        
+        4. ✅ MANDATORY PARTS THRESHOLD + LOW-STOCK FLAG - 4 sub-tests, all passed
+           - Create part with threshold_qty=999, qty=1: created successfully ✓
+           - GET mandatory parts: current_stock=1.0, threshold_qty=999.0, is_low=true ✓
+           - Create part with threshold_qty=0: created successfully ✓
+           - GET mandatory parts: current_stock=500.0, threshold_qty=0.0, is_low=false ✓
+           - is_low calculation logic correct: (threshold_qty > 0 AND current_stock < threshold_qty) ✓
+        
+        All Core Functionality Verified:
+        - Per-system DLP settings stored and retrieved independently for Hero and TVS
+        - Orders compute landed_price using correct system DLP
+        - Add-items endpoint appends items with correct DLP, dedupes by normalized part_no, rejects sent orders
+        - Mandatory parts threshold and low-stock flag working as expected
+        - Inventory freshness gate working (24h TTL)
+        - All endpoints return correct HTTP status codes and response shapes
+        
+        NO CRITICAL ISSUES FOUND. All new features are production-ready.

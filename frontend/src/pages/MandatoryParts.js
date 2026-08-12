@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { PushPin, Plus, Trash, Info } from "@phosphor-icons/react";
+import { PushPin, Plus, Trash, Info, Warning, ShoppingCart, X } from "@phosphor-icons/react";
 import api, { formatApiError } from "@/lib/api";
 import { IDS } from "@/lib/testIds";
 import { useSystem } from "@/context/SystemContext";
@@ -8,9 +9,17 @@ import { useSystem } from "@/context/SystemContext";
 export default function MandatoryParts() {
   const [items, setItems] = useState([]);
   const [enabled, setEnabled] = useState(false);
-  const [form, setForm] = useState({ part_no: "", description: "", mrp: 0, qty: 1 });
+  const [form, setForm] = useState({
+    part_no: "",
+    description: "",
+    mrp: 0,
+    qty: 1,
+    threshold_qty: 0,
+  });
   const [saving, setSaving] = useState(false);
+  const [addToOrderPart, setAddToOrderPart] = useState(null); // the part being added to an order
   const { meta } = useSystem();
+  const navigate = useNavigate();
 
   const load = () =>
     api.get("/mandatory-parts").then((r) => {
@@ -21,6 +30,8 @@ export default function MandatoryParts() {
   useEffect(() => {
     load();
   }, [meta?.key]);
+
+  const lowCount = items.filter((i) => i.is_low).length;
 
   const toggleEnabled = async (val) => {
     setEnabled(val); // optimistic
@@ -46,9 +57,10 @@ export default function MandatoryParts() {
         description: form.description.trim(),
         mrp: Number(form.mrp || 0),
         qty: Number(form.qty || 1),
+        threshold_qty: Number(form.threshold_qty || 0),
       });
       toast.success(`Added ${form.part_no.trim()} to mandatory parts`);
-      setForm({ part_no: "", description: "", mrp: 0, qty: 1 });
+      setForm({ part_no: "", description: "", mrp: 0, qty: 1, threshold_qty: 0 });
       load();
     } catch (e) {
       toast.error(formatApiError(e.response?.data?.detail) || e.message);
@@ -66,6 +78,7 @@ export default function MandatoryParts() {
         description: patch.description ?? existing.description,
         mrp: Number(patch.mrp ?? existing.mrp),
         qty: Number(patch.qty ?? existing.qty),
+        threshold_qty: Number(patch.threshold_qty ?? existing.threshold_qty ?? 0),
       });
       load();
     } catch (e) {
@@ -80,17 +93,53 @@ export default function MandatoryParts() {
     load();
   };
 
+  const stockBadge = (it) => {
+    if (it.is_low) {
+      return (
+        <span className="badge badge-stock-low" data-testid={`mandatory-low-${it.id}`}>
+          Low: {it.current_stock}
+        </span>
+      );
+    }
+    if (Number(it.threshold_qty || 0) <= 0) {
+      return (
+        <span className="badge" style={{ color: "var(--hero-muted)" }}>
+          {it.current_stock ?? 0}
+        </span>
+      );
+    }
+    return <span className="badge badge-stock-ok">{it.current_stock}</span>;
+  };
+
   return (
     <div data-testid={IDS.mandatoryPage} className="page p-10 max-w-5xl">
       <div className="overline mb-2">Order defaults</div>
       <h1 className="font-display font-bold text-4xl mb-2 page-title">
         Mandatory Parts
       </h1>
-      <p className="text-sm mb-8" style={{ color: "var(--hero-muted)", maxWidth: 620 }}>
-        Parts here are auto-included in every new order sheet you create. Use
-        the toggle to enable or disable this behaviour globally without deleting
-        the list.
+      <p className="text-sm mb-8" style={{ color: "var(--hero-muted)", maxWidth: 640 }}>
+        Parts here are auto-included in every new order sheet you create. Set a
+        reorder <b>threshold</b> to be alerted when stock runs low — you can then
+        add the part straight into an order of your choice.
       </p>
+
+      {/* Low-stock alert banner */}
+      {lowCount > 0 && (
+        <div
+          className="card p-4 mb-6 flex items-center gap-3"
+          data-testid="mandatory-low-banner"
+          style={{
+            border: "1px solid rgba(245,158,11,0.5)",
+            background: "rgba(245,158,11,0.08)",
+          }}
+        >
+          <Warning size={18} color="#f59e0b" weight="fill" />
+          <div className="text-sm" style={{ color: "#fcd34d" }}>
+            {lowCount} mandatory part{lowCount === 1 ? "" : "s"} below threshold.
+            Use <b>Add to order</b> to reorder.
+          </div>
+        </div>
+      )}
 
       {/* Toggle card */}
       <div className="card p-5 mb-6">
@@ -175,6 +224,18 @@ export default function MandatoryParts() {
               onChange={(e) => setForm({ ...form, qty: e.target.value })}
             />
           </div>
+          <div>
+            <label className="overline block mb-2">Reorder threshold</label>
+            <input
+              data-testid="mandatory-threshold"
+              className="field mono"
+              type="number"
+              min="0"
+              value={form.threshold_qty}
+              onChange={(e) => setForm({ ...form, threshold_qty: e.target.value })}
+              placeholder="0 = no alert"
+            />
+          </div>
         </div>
         <div className="mt-4">
           <button
@@ -201,7 +262,7 @@ export default function MandatoryParts() {
           </div>
           <div className="text-xs" style={{ color: "var(--hero-muted)" }}>
             <Info size={11} style={{ display: "inline", marginRight: 4 }} />
-            Applied when creating a NEW order (existing orders untouched).
+            Stock compared against current inventory.
           </div>
         </div>
         {items.length === 0 ? (
@@ -220,12 +281,14 @@ export default function MandatoryParts() {
                   <th>Description</th>
                   <th className="num">MRP</th>
                   <th className="num">Default Qty</th>
+                  <th className="num">Threshold</th>
+                  <th className="center">Stock</th>
                   <th></th>
                 </tr>
               </thead>
               <tbody>
                 {items.map((it) => (
-                  <tr key={it.id}>
+                  <tr key={it.id} data-testid={`mandatory-row-${it.id}`}>
                     <td className="font-mono">{it.part_no}</td>
                     <td>
                       <input
@@ -265,15 +328,42 @@ export default function MandatoryParts() {
                         style={{ width: 80, textAlign: "right" }}
                       />
                     </td>
+                    <td className="num">
+                      <input
+                        className="field field-sm mono num"
+                        data-testid={`mandatory-threshold-${it.id}`}
+                        type="number"
+                        min="0"
+                        defaultValue={it.threshold_qty || 0}
+                        onBlur={(e) =>
+                          Number(e.target.value) !== Number(it.threshold_qty || 0) &&
+                          update(it.id, { threshold_qty: Number(e.target.value) })
+                        }
+                        style={{ width: 80, textAlign: "right" }}
+                      />
+                    </td>
+                    <td className="center">{stockBadge(it)}</td>
                     <td className="center">
-                      <button
-                        className="btn btn-ghost"
-                        style={{ padding: "4px 6px", color: "#f87171" }}
-                        onClick={() => remove(it.id)}
-                        data-testid={`mandatory-remove-${it.id}`}
-                      >
-                        <Trash size={12} />
-                      </button>
+                      <div className="flex items-center gap-1 justify-center">
+                        <button
+                          className={`btn ${it.is_low ? "btn-primary" : "btn-outline"}`}
+                          style={{ padding: "4px 8px", fontSize: "11px" }}
+                          onClick={() => setAddToOrderPart(it)}
+                          data-testid={`mandatory-addtoorder-${it.id}`}
+                          title="Add this part to an order"
+                        >
+                          <ShoppingCart size={12} />
+                          Add to order
+                        </button>
+                        <button
+                          className="btn btn-ghost"
+                          style={{ padding: "4px 6px", color: "#f87171" }}
+                          onClick={() => remove(it.id)}
+                          data-testid={`mandatory-remove-${it.id}`}
+                        >
+                          <Trash size={12} />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -281,6 +371,164 @@ export default function MandatoryParts() {
             </table>
           </div>
         )}
+      </div>
+
+      {addToOrderPart && (
+        <AddToOrderDialog
+          part={addToOrderPart}
+          onClose={() => setAddToOrderPart(null)}
+          onDone={(orderId) => {
+            setAddToOrderPart(null);
+            if (orderId) navigate(`/orders/${orderId}`);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function AddToOrderDialog({ part, onClose, onDone }) {
+  const [orders, setOrders] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [qty, setQty] = useState(Number(part.qty || 1));
+
+  useEffect(() => {
+    api
+      .get("/orders", { params: { status: "current" } })
+      .then((r) => setOrders(r.data || []))
+      .catch(() => setOrders([]));
+  }, []);
+
+  const payloadItem = () => ({
+    part_no: part.part_no,
+    description: part.description || "",
+    mrp: Number(part.mrp || 0),
+    qty: Math.max(1, Number(qty || 1)),
+  });
+
+  const addToExisting = async (orderId) => {
+    setBusy(true);
+    try {
+      const { data } = await api.post(`/orders/${orderId}/add-items`, {
+        items: [payloadItem()],
+      });
+      if (data.added > 0) {
+        toast.success(`Added ${part.part_no} to order`);
+      } else {
+        toast.info(`${part.part_no} is already in that order`);
+      }
+      onDone(orderId);
+    } catch (e) {
+      toast.error(formatApiError(e.response?.data?.detail) || e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const createNew = async () => {
+    setBusy(true);
+    try {
+      const { data } = await api.post("/orders", {
+        items: [payloadItem()],
+        remarks: "",
+      });
+      toast.success(`Created ${data.order_no} with ${part.part_no}`);
+      onDone(data.id);
+    } catch (e) {
+      const detail = e.response?.data?.detail;
+      toast.error(formatApiError(detail) || e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      data-testid="addtoorder-dialog"
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 60,
+        padding: 16,
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="card p-6"
+        style={{ maxWidth: 460, width: "100%" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <div className="overline mb-1">Add to order</div>
+            <div className="font-mono text-base">{part.part_no}</div>
+            <div className="text-xs" style={{ color: "var(--hero-muted)" }}>
+              {part.description || "—"}
+            </div>
+          </div>
+          <button className="btn btn-ghost" style={{ padding: 6 }} onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="mb-4 flex items-center gap-2">
+          <label className="overline">Qty</label>
+          <input
+            className="field field-sm mono num"
+            data-testid="addtoorder-qty"
+            type="number"
+            min="1"
+            value={qty}
+            onChange={(e) => setQty(e.target.value)}
+            style={{ width: 90, textAlign: "right" }}
+          />
+        </div>
+
+        <div className="overline mb-2">Choose an order</div>
+        {orders === null ? (
+          <div className="text-sm" style={{ color: "var(--hero-muted)" }}>
+            Loading current orders…
+          </div>
+        ) : (
+          <div className="grid gap-2 mb-4" style={{ maxHeight: 220, overflowY: "auto" }}>
+            {orders.length === 0 ? (
+              <div className="text-sm" style={{ color: "var(--hero-muted)" }}>
+                No current (draft) orders. Create a new one below.
+              </div>
+            ) : (
+              orders.map((o) => (
+                <button
+                  key={o.id}
+                  className="btn btn-outline"
+                  data-testid={`addtoorder-existing-${o.id}`}
+                  disabled={busy}
+                  onClick={() => addToExisting(o.id)}
+                  style={{ justifyContent: "space-between" }}
+                >
+                  <span className="font-mono">{o.order_no}</span>
+                  <span style={{ color: "var(--hero-muted)", fontSize: 12 }}>
+                    {(o.items || []).length} items
+                  </span>
+                </button>
+              ))
+            )}
+          </div>
+        )}
+
+        <button
+          className="btn btn-primary"
+          data-testid="addtoorder-new"
+          disabled={busy}
+          onClick={createNew}
+          style={{ width: "100%" }}
+        >
+          <Plus size={14} weight="bold" />
+          <span>{busy ? "Working…" : "Create new order with this part"}</span>
+        </button>
       </div>
     </div>
   );

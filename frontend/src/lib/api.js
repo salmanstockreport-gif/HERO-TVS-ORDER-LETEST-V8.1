@@ -17,6 +17,8 @@ const SYSTEM_SCOPED = [
   /^\/important-parts(\?|$)/,
   /^\/mandatory-parts(\?|$)/,
   /^\/mandatory-toggle/,
+  /^\/settings(\?|$)/,             // per-system DLP / discount
+  /^\/settings\/discount/,
 ];
 
 client.interceptors.request.use((config) => {

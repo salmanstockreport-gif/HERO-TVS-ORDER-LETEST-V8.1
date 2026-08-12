@@ -51,6 +51,7 @@ export default function OrderEditor() {
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [addQty, setAddQty] = useState({}); // part_no -> qty for search-result rows
+  const [selected, setSelected] = useState({}); // part_no -> bool for bulk add
 
   const [duplicateWarn, setDuplicateWarn] = useState("");
   const [previouslyOrdered, setPreviouslyOrdered] = useState(null);
@@ -183,6 +184,7 @@ export default function OrderEditor() {
     setSearchError("");
     setSearchResults([]);
     setAddQty({});
+    setSelected({});
     setDuplicateWarn("");
     setPreviouslyOrdered(null);
     setManualOpen(false);
@@ -310,6 +312,72 @@ export default function OrderEditor() {
     setPreviouslyOrdered(null);
     setAddQty({});
     toast.success(`Added ${formatted} × ${qty}`);
+  };
+
+  // Bulk add: add every checked search result (with its per-row qty) to the
+  // order in one action. Skips parts already in the order.
+  const addSelected = () => {
+    const chosen = searchResults.filter((p) => selected[p.part_no]);
+    if (chosen.length === 0) {
+      toast.error("Select at least one part first.");
+      return;
+    }
+    const existingNorms = new Set(items.map((it) => partNoKey(it.part_no)));
+    const toAdd = [];
+    let skipped = 0;
+    for (const p of chosen) {
+      const formatted = formatPartNoForSystem(p.part_no, meta?.key);
+      const norm = partNoKey(formatted);
+      if (existingNorms.has(norm)) {
+        skipped += 1;
+        continue;
+      }
+      existingNorms.add(norm);
+      const qty = Math.max(
+        1,
+        Math.floor(Number(addQty[p.part_no] ?? p.moq ?? 1) || 1),
+      );
+      toAdd.push(
+        recomputeItem({
+          ...emptyItem(),
+          part_no: formatted,
+          description: p.description || "",
+          mrp: Number(p.mrp || 0),
+          moq: p.moq || null,
+          qty,
+          discount_percent: Number(globalDiscount),
+        }),
+      );
+    }
+    if (toAdd.length === 0) {
+      toast.error("All selected parts are already in this order.");
+      return;
+    }
+    setItems((prev) => [...prev, ...toAdd]);
+    setSearchResults([]);
+    setSearchQuery("");
+    setSelected({});
+    setAddQty({});
+    setDuplicateWarn("");
+    setPreviouslyOrdered(null);
+    toast.success(
+      `Added ${toAdd.length} part${toAdd.length > 1 ? "s" : ""}${skipped ? ` (${skipped} skipped as duplicates)` : ""}`,
+    );
+  };
+
+  const selectedCount = searchResults.filter((p) => selected[p.part_no]).length;
+  const allSelected =
+    searchResults.length > 0 && selectedCount === searchResults.length;
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelected({});
+    } else {
+      const next = {};
+      searchResults.forEach((p) => {
+        next[p.part_no] = true;
+      });
+      setSelected(next);
+    }
   };
 
   const updateItem = (idx, patch) => {
@@ -831,13 +899,46 @@ export default function OrderEditor() {
               data-testid={IDS.editorSearchResult}
               className="mt-4"
             >
-              <div className="overline mb-2">
-                {searchResults.length} match{searchResults.length > 1 ? "es" : ""}
+              <div className="flex items-center justify-between gap-3 mb-2 flex-wrap">
+                <div className="overline">
+                  {searchResults.length} match{searchResults.length > 1 ? "es" : ""}
+                  {searchResults.length > 1 && (
+                    <span style={{ color: "var(--hero-muted)", marginLeft: 8, textTransform: "none", letterSpacing: 0 }}>
+                      — tick the parts you want and add them together
+                    </span>
+                  )}
+                </div>
+                <button
+                  data-testid="editor-add-selected-btn"
+                  className="btn btn-primary"
+                  onClick={addSelected}
+                  disabled={selectedCount === 0}
+                  style={{
+                    padding: "6px 12px",
+                    fontSize: "12px",
+                    opacity: selectedCount === 0 ? 0.5 : 1,
+                    cursor: selectedCount === 0 ? "not-allowed" : "pointer",
+                  }}
+                >
+                  <Plus size={14} weight="bold" />
+                  <span>
+                    Add selected{selectedCount > 0 ? ` (${selectedCount})` : ""}
+                  </span>
+                </button>
               </div>
               <div className="table-scroll">
               <table className="hero-table">
                 <thead>
                   <tr>
+                    <th className="center" style={{ width: 36 }}>
+                      <input
+                        type="checkbox"
+                        data-testid="editor-select-all"
+                        checked={allSelected}
+                        onChange={toggleSelectAll}
+                        aria-label="Select all"
+                      />
+                    </th>
                     <th>Part No.</th>
                     <th>Description</th>
                     <th className="num">MOQ</th>
@@ -886,6 +987,20 @@ export default function OrderEditor() {
                     }
                     return (
                       <tr key={p.part_no}>
+                        <td className="center">
+                          <input
+                            type="checkbox"
+                            data-testid={`search-select-${p.part_no}`}
+                            checked={!!selected[p.part_no]}
+                            onChange={(e) =>
+                              setSelected((prev) => ({
+                                ...prev,
+                                [p.part_no]: e.target.checked,
+                              }))
+                            }
+                            aria-label={`Select ${formatted}`}
+                          />
+                        </td>
                         <td className="font-mono">{formatted}</td>
                         <td>{p.description}</td>
                         <td className="num">{p.moq ?? "-"}</td>

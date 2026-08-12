@@ -1,1141 +1,485 @@
 #!/usr/bin/env python3
 """
-Backend API Testing for Hero + TVS Parts Ordering System
-Tests all endpoints with focus on dual-system support and permission enforcement
+Backend API Testing for Hero/TVS Parts Ordering App
+Tests new features: per-system DLP, add-items endpoint, mandatory parts threshold
 """
 
 import requests
+import json
 import io
-import sys
-from openpyxl import Workbook
+from datetime import datetime
 
 # Backend URL from frontend/.env
-BASE_URL = "https://instant-ship-7.preview.emergentagent.com/api"
+BASE_URL = "https://90281e1c-2500-4a02-801f-b32afda84490.preview.emergentagent.com/api"
 
 # Test credentials
-OWNER_USERNAME = "admin"
-OWNER_PASSWORD = "admin123"
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "admin123"
 
-# Global state
-owner_token = None
-employee_token = None
-employee_id = None
-hero_order_id = None
-tvs_order_id = None
-hero_important_part_id = None
-tvs_important_part_id = None
-hero_mandatory_part_id = None
-tvs_mandatory_part_id = None
+# Global token storage
+token = None
 
-def print_test(name):
-    """Print test name"""
-    print(f"\n{'='*80}")
-    print(f"TEST: {name}")
-    print('='*80)
+def log(msg):
+    """Print timestamped log message"""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-def print_result(passed, message=""):
-    """Print test result"""
-    status = "✅ PASS" if passed else "❌ FAIL"
-    print(f"{status}: {message}")
-    return passed
+def login():
+    """Login as admin and get access token"""
+    global token
+    log("TEST 1: Login as admin")
+    resp = requests.post(f"{BASE_URL}/auth/login", json={
+        "username": ADMIN_USERNAME,
+        "password": ADMIN_PASSWORD
+    })
+    assert resp.status_code == 200, f"Login failed: {resp.status_code} {resp.text}"
+    data = resp.json()
+    assert "access_token" in data, "No access_token in response"
+    token = data["access_token"]
+    log(f"✅ Login successful, token obtained")
+    return data
 
-def create_test_inventory_xlsx():
-    """Create a minimal test inventory Excel file"""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Inventory"
-    
-    # Headers
-    ws['A1'] = "Part No"
-    ws['B1'] = "Stock Qty"
-    ws['C1'] = "Description"
-    
-    # Test data - TVS part
-    ws['A2'] = "N3012050"
-    ws['B2'] = 5
-    ws['C2'] = "VALVE STEM OIL SEAL"
-    
-    # Test data - Hero part
-    ws['A3'] = "23121KST901"
-    ws['B3'] = 10
-    ws['C3'] = "Sample Hero Part"
-    
-    # Save to bytes
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output.getvalue()
+def headers():
+    """Return auth headers"""
+    return {"Authorization": f"Bearer {token}"}
 
-def test_1_auth_login():
-    """Test 1: Auth response shape - login with admin/admin123"""
-    global owner_token
+def upload_inventory():
+    """Upload a small inventory file to pass the 24h freshness gate"""
+    log("TEST 2: Upload inventory (for 24h freshness gate)")
     
-    print_test("1. Auth Login - Owner credentials")
+    # Create a minimal CSV inventory
+    csv_content = """Part No,Description,Stock Qty
+TESTPART1,Test Part 1,100
+TESTPART2,Test Part 2,50
+MANDLOW1,Mandatory Low Stock Part,1
+MANDOK1,Mandatory OK Stock Part,500
+23121KST901,Hero Test Part,200
+N3012050,TVS Test Part,150
+"""
     
-    try:
-        response = requests.post(
-            f"{BASE_URL}/auth/login",
-            json={"username": OWNER_USERNAME, "password": OWNER_PASSWORD},
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"Login failed with status {response.status_code}: {response.text}")
-        
-        data = response.json()
-        
-        # Check access_token
-        if "access_token" not in data:
-            return print_result(False, "Missing access_token in response")
-        
-        owner_token = data["access_token"]
-        
-        # Check user object
-        if "user" not in data:
-            return print_result(False, "Missing user object in response")
-        
-        user = data["user"]
-        
-        # Check role
-        if user.get("role") != "owner":
-            return print_result(False, f"Expected role='owner', got '{user.get('role')}'")
-        
-        # Check systems
-        systems = user.get("systems", [])
-        if "hero" not in systems or "tvs" not in systems:
-            return print_result(False, f"Expected systems=['hero', 'tvs'], got {systems}")
-        
-        # Check permissions - all 10 should be true
-        permissions = user.get("permissions", {})
-        expected_perms = [
-            "orders_create_edit", "orders_delete", "orders_mark_sent",
-            "search_ecatalogue", "inventory_view", "inventory_upload",
-            "manage_important_parts", "manage_mandatory_parts",
-            "change_discount", "backup_restore"
-        ]
-        
-        for perm in expected_perms:
-            if not permissions.get(perm):
-                return print_result(False, f"Permission '{perm}' is not true")
-        
-        print(f"Owner token: {owner_token[:20]}...")
-        print(f"User: {user.get('username')}, Role: {user.get('role')}, Systems: {systems}")
-        print(f"Permissions: {len([k for k, v in permissions.items() if v])}/10 enabled")
-        
-        return print_result(True, "Login successful with correct response shape")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
+    files = {
+        'file': ('inventory.csv', io.BytesIO(csv_content.encode('utf-8')), 'text/csv')
+    }
+    
+    # Form data with column mappings
+    data = {
+        'part_no': 'Part No',
+        'description': 'Description',
+        'stock_qty': 'Stock Qty',
+        'location': '',
+        'rate': '',
+        'replace': 'true'
+    }
+    
+    resp = requests.post(f"{BASE_URL}/inventory/upload", 
+                        headers=headers(), 
+                        files=files,
+                        data=data)
+    
+    assert resp.status_code == 200, f"Inventory upload failed: {resp.status_code} {resp.text}"
+    result = resp.json()
+    log(f"✅ Inventory uploaded: {result.get('imported', 0)} items imported")
+    return result
 
-def test_2_inventory_freshness_gate():
-    """Test 2: Inventory freshness gate - should return 423 when stale"""
-    print_test("2. Inventory Freshness Gate - Test 423 response")
+def test_per_system_dlp():
+    """Test 1: Per-system DLP / discount (Hero vs TVS separate)"""
+    log("\n=== TEST 3: Per-system DLP / Discount ===")
     
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        # Try TVS search without inventory
-        response = requests.get(
-            f"{BASE_URL}/tvs/search",
-            params={"q": "N3012050"},
-            headers=headers,
-            timeout=30
-        )
-        
-        # Should return 423 if inventory is stale
-        if response.status_code == 423:
-            data = response.json()
-            detail = data.get("detail", {})
-            if isinstance(detail, dict) and detail.get("code") == "inventory_stale":
-                return print_result(True, "Correctly returned 423 with inventory_stale code")
+    # Set Hero DLP to 25%
+    log("3.1: Set Hero DLP to 25%")
+    resp = requests.put(f"{BASE_URL}/settings/discount?system=hero",
+                       headers=headers(),
+                       json={"discount_percent": 25})
+    assert resp.status_code == 200, f"Failed to set Hero DLP: {resp.status_code} {resp.text}"
+    data = resp.json()
+    assert data["discount_percent"] == 25, f"Expected 25, got {data['discount_percent']}"
+    assert data["system"] == "hero", f"Expected system=hero, got {data['system']}"
+    log(f"✅ Hero DLP set to 25%")
+    
+    # Set TVS DLP to 10%
+    log("3.2: Set TVS DLP to 10%")
+    resp = requests.put(f"{BASE_URL}/settings/discount?system=tvs",
+                       headers=headers(),
+                       json={"discount_percent": 10})
+    assert resp.status_code == 200, f"Failed to set TVS DLP: {resp.status_code} {resp.text}"
+    data = resp.json()
+    assert data["discount_percent"] == 10, f"Expected 10, got {data['discount_percent']}"
+    assert data["system"] == "tvs", f"Expected system=tvs, got {data['system']}"
+    log(f"✅ TVS DLP set to 10%")
+    
+    # Get Hero settings
+    log("3.3: GET /api/settings?system=hero")
+    resp = requests.get(f"{BASE_URL}/settings?system=hero", headers=headers())
+    assert resp.status_code == 200, f"Failed to get Hero settings: {resp.status_code} {resp.text}"
+    data = resp.json()
+    log(f"   Hero settings: discount_percent={data.get('discount_percent')}, "
+        f"discount_percent_hero={data.get('discount_percent_hero')}, "
+        f"discount_percent_tvs={data.get('discount_percent_tvs')}")
+    
+    assert data["discount_percent"] == 25, f"Expected discount_percent=25 for Hero, got {data['discount_percent']}"
+    assert data["discount_percent_hero"] == 25, f"Expected discount_percent_hero=25, got {data['discount_percent_hero']}"
+    assert data["discount_percent_tvs"] == 10, f"Expected discount_percent_tvs=10, got {data['discount_percent_tvs']}"
+    log(f"✅ Hero settings correct: discount_percent=25, discount_percent_hero=25, discount_percent_tvs=10")
+    
+    # Get TVS settings
+    log("3.4: GET /api/settings?system=tvs")
+    resp = requests.get(f"{BASE_URL}/settings?system=tvs", headers=headers())
+    assert resp.status_code == 200, f"Failed to get TVS settings: {resp.status_code} {resp.text}"
+    data = resp.json()
+    log(f"   TVS settings: discount_percent={data.get('discount_percent')}, "
+        f"discount_percent_hero={data.get('discount_percent_hero')}, "
+        f"discount_percent_tvs={data.get('discount_percent_tvs')}")
+    
+    assert data["discount_percent"] == 10, f"Expected discount_percent=10 for TVS, got {data['discount_percent']}"
+    assert data["discount_percent_hero"] == 25, f"Expected discount_percent_hero=25, got {data['discount_percent_hero']}"
+    assert data["discount_percent_tvs"] == 10, f"Expected discount_percent_tvs=10, got {data['discount_percent_tvs']}"
+    log(f"✅ TVS settings correct: discount_percent=10, discount_percent_hero=25, discount_percent_tvs=10")
+    
+    # Verify independence: change Hero again and check TVS unchanged
+    log("3.5: Verify independence - change Hero to 30%, check TVS still 10%")
+    resp = requests.put(f"{BASE_URL}/settings/discount?system=hero",
+                       headers=headers(),
+                       json={"discount_percent": 30})
+    assert resp.status_code == 200, f"Failed to update Hero DLP: {resp.status_code} {resp.text}"
+    
+    resp = requests.get(f"{BASE_URL}/settings?system=tvs", headers=headers())
+    assert resp.status_code == 200, f"Failed to get TVS settings: {resp.status_code} {resp.text}"
+    data = resp.json()
+    assert data["discount_percent"] == 10, f"TVS DLP changed unexpectedly to {data['discount_percent']}"
+    assert data["discount_percent_hero"] == 30, f"Hero DLP not updated to 30, got {data['discount_percent_hero']}"
+    log(f"✅ Systems are independent: Hero=30%, TVS=10%")
+    
+    # Reset Hero back to 25% for subsequent tests
+    log("3.6: Reset Hero DLP back to 25%")
+    resp = requests.put(f"{BASE_URL}/settings/discount?system=hero",
+                       headers=headers(),
+                       json={"discount_percent": 25})
+    assert resp.status_code == 200, f"Failed to reset Hero DLP: {resp.status_code} {resp.text}"
+    log(f"✅ Hero DLP reset to 25%")
+
+def cleanup_existing_orders():
+    """Clean up existing draft orders to avoid hitting the limit"""
+    log("Cleanup: Checking for existing draft orders")
+    
+    # Get Hero orders
+    resp = requests.get(f"{BASE_URL}/orders?system=hero", headers=headers())
+    if resp.status_code == 200:
+        orders = resp.json()
+        hero_current = [o for o in orders if o.get("status") == "current"]
+        log(f"   Found {len(hero_current)} current Hero orders")
+        for order in hero_current:
+            order_id = order["id"]
+            # Add at least one item if empty
+            if not order.get("items"):
+                requests.put(f"{BASE_URL}/orders/{order_id}", 
+                           headers=headers(),
+                           json={"items": [{"part_no": "DUMMY", "description": "Dummy", "mrp": 1, "qty": 1}], "remarks": ""})
+            # Mark as sent
+            resp = requests.post(f"{BASE_URL}/orders/{order_id}/mark-sent", headers=headers())
+            if resp.status_code == 200:
+                log(f"   ✓ Marked Hero order {order_id} as sent")
             else:
-                return print_result(False, f"Got 423 but wrong detail: {detail}")
-        elif response.status_code == 200:
-            # Inventory might already be fresh from previous tests
-            print("⚠️  WARNING: Inventory is already fresh (200 response)")
-            return print_result(True, "Inventory is fresh (skipping stale test)")
-        else:
-            return print_result(False, f"Unexpected status {response.status_code}: {response.text}")
-            
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
+                log(f"   ✗ Failed to mark Hero order {order_id} as sent: {resp.status_code}")
+    
+    # Get TVS orders
+    resp = requests.get(f"{BASE_URL}/orders?system=tvs", headers=headers())
+    if resp.status_code == 200:
+        orders = resp.json()
+        tvs_current = [o for o in orders if o.get("status") == "current"]
+        log(f"   Found {len(tvs_current)} current TVS orders")
+        for order in tvs_current:
+            order_id = order["id"]
+            # Add at least one item if empty
+            if not order.get("items"):
+                requests.put(f"{BASE_URL}/orders/{order_id}", 
+                           headers=headers(),
+                           json={"items": [{"part_no": "DUMMY", "description": "Dummy", "mrp": 1, "qty": 1}], "remarks": ""})
+            # Mark as sent
+            resp = requests.post(f"{BASE_URL}/orders/{order_id}/mark-sent", headers=headers())
+            if resp.status_code == 200:
+                log(f"   ✓ Marked TVS order {order_id} as sent")
+            else:
+                log(f"   ✗ Failed to mark TVS order {order_id} as sent: {resp.status_code}")
 
-def test_3_inventory_upload():
-    """Test 3: Upload inventory"""
-    print_test("3. Inventory Upload - Upload test inventory")
+def test_order_uses_system_dlp():
+    """Test 2: Order uses system DLP"""
+    log("\n=== TEST 4: Order Uses System DLP ===")
     
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        # Create test inventory file
-        xlsx_data = create_test_inventory_xlsx()
-        
-        files = {
-            'file': ('test_inventory.xlsx', xlsx_data, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        }
-        
-        data = {
-            'part_no': 'Part No',
-            'stock_qty': 'Stock Qty',
-            'description': 'Description',
-            'replace': 'true'
-        }
-        
-        response = requests.post(
-            f"{BASE_URL}/inventory/upload",
-            headers=headers,
-            files=files,
-            data=data,
-            timeout=30
-        )
-        
-        if response.status_code not in [200, 201]:
-            return print_result(False, f"Upload failed with status {response.status_code}: {response.text}")
-        
-        result = response.json()
-        
-        if not result.get("success"):
-            return print_result(False, "Upload did not return success=true")
-        
-        imported = result.get("imported", 0)
-        if imported < 1:
-            return print_result(False, f"Expected at least 1 imported row, got {imported}")
-        
-        print(f"Imported {imported} inventory items")
-        return print_result(True, f"Inventory uploaded successfully ({imported} items)")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_4_tvs_ecatalogue_search():
-    """Test 4: TVS eCatalogue search"""
-    print_test("4. TVS eCatalogue Search - Search for N3012050")
+    # Clean up existing orders first
+    cleanup_existing_orders()
     
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        response = requests.get(
-            f"{BASE_URL}/tvs/search",
-            params={"q": "N3012050"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code == 502:
-            # TVS eCatalogue might be unreachable
-            print("⚠️  WARNING: TVS eCatalogue unreachable (502)")
-            return print_result(True, "TVS eCatalogue unreachable - acceptable for external API")
-        
-        if response.status_code != 200:
-            return print_result(False, f"Search failed with status {response.status_code}: {response.text}")
-        
-        data = response.json()
-        
-        if "parts" not in data:
-            return print_result(False, "Missing 'parts' array in response")
-        
-        parts = data["parts"]
-        
-        if len(parts) < 1:
-            return print_result(False, "Expected at least 1 part in results")
-        
-        # Check first part
-        first_part = parts[0]
-        
-        if first_part.get("part_no") != "N3012050":
-            return print_result(False, f"Expected part_no='N3012050', got '{first_part.get('part_no')}'")
-        
-        description = first_part.get("description", "")
-        if "VALVE STEM OIL SEAL" not in description.upper():
-            return print_result(False, f"Expected description containing 'VALVE STEM OIL SEAL', got '{description}'")
-        
-        mrp = first_part.get("mrp")
-        if mrp != 80:
-            print(f"⚠️  WARNING: Expected MRP=80, got {mrp} (TVS API might have changed)")
-        
-        print(f"Found {len(parts)} parts")
-        print(f"First part: {first_part.get('part_no')} - {first_part.get('description')} - MRP: {first_part.get('mrp')}")
-        
-        return print_result(True, "TVS search successful with correct data")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_5_hero_ecatalogue_search():
-    """Test 5: Hero eCatalogue search"""
-    print_test("5. Hero eCatalogue Search - Test Hero search endpoint")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        response = requests.get(
-            f"{BASE_URL}/hero/search",
-            params={"q": "23121KST901"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code == 502:
-            # Hero eCatalogue might be unreachable
-            print("⚠️  WARNING: Hero eCatalogue unreachable (502)")
-            return print_result(True, "Hero eCatalogue unreachable - acceptable for external API")
-        
-        if response.status_code != 200:
-            return print_result(False, f"Search failed with status {response.status_code}: {response.text}")
-        
-        data = response.json()
-        
-        if "parts" not in data:
-            return print_result(False, "Missing 'parts' array in response")
-        
-        print(f"Hero search returned {len(data['parts'])} parts")
-        return print_result(True, "Hero search endpoint working")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_6_system_scoped_orders_create():
-    """Test 6: System-scoped orders - Create orders for hero and tvs"""
-    global hero_order_id, tvs_order_id
-    
-    print_test("6. System-Scoped Orders - Create Hero and TVS orders")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        # Create Hero order
-        hero_body = {
-            "items": [{
-                "part_no": "23121KST901",
-                "description": "Sample Hero Part",
-                "mrp": 100,
-                "qty": 1
-            }],
-            "remarks": "hero test order"
-        }
-        
-        response = requests.post(
-            f"{BASE_URL}/orders",
-            params={"system": "hero"},
-            headers=headers,
-            json=hero_body,
-            timeout=30
-        )
-        
-        if response.status_code not in [200, 201]:
-            return print_result(False, f"Hero order creation failed with status {response.status_code}: {response.text}")
-        
-        hero_order = response.json()
-        hero_order_id = hero_order.get("id")
-        hero_order_no = hero_order.get("order_no")
-        
-        if not hero_order_no or not hero_order_no.startswith("HMC-"):
-            return print_result(False, f"Hero order_no should start with 'HMC-', got '{hero_order_no}'")
-        
-        if hero_order.get("system") != "hero":
-            return print_result(False, f"Hero order system field should be 'hero', got '{hero_order.get('system')}'")
-        
-        print(f"Hero order created: {hero_order_no} (ID: {hero_order_id})")
-        
-        # Create TVS order
-        tvs_body = {
-            "items": [{
-                "part_no": "N3012050",
-                "description": "VALVE STEM OIL SEAL",
-                "mrp": 80,
-                "qty": 1
-            }],
-            "remarks": "tvs test order"
-        }
-        
-        response = requests.post(
-            f"{BASE_URL}/orders",
-            params={"system": "tvs"},
-            headers=headers,
-            json=tvs_body,
-            timeout=30
-        )
-        
-        if response.status_code not in [200, 201]:
-            return print_result(False, f"TVS order creation failed with status {response.status_code}: {response.text}")
-        
-        tvs_order = response.json()
-        tvs_order_id = tvs_order.get("id")
-        tvs_order_no = tvs_order.get("order_no")
-        
-        if not tvs_order_no or not tvs_order_no.startswith("TVS-"):
-            return print_result(False, f"TVS order_no should start with 'TVS-', got '{tvs_order_no}'")
-        
-        if tvs_order.get("system") != "tvs":
-            return print_result(False, f"TVS order system field should be 'tvs', got '{tvs_order.get('system')}'")
-        
-        print(f"TVS order created: {tvs_order_no} (ID: {tvs_order_id})")
-        
-        return print_result(True, "Both Hero and TVS orders created successfully")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_7_system_scoped_orders_filter():
-    """Test 7: System-scoped orders - Filter by system"""
-    print_test("7. System-Scoped Orders - Filter by system")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        # Get Hero orders
-        response = requests.get(
-            f"{BASE_URL}/orders",
-            params={"system": "hero"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"Hero orders fetch failed with status {response.status_code}: {response.text}")
-        
-        hero_orders = response.json()
-        
-        # Check all orders are hero system
-        for order in hero_orders:
-            if order.get("system") != "hero":
-                return print_result(False, f"Found non-hero order in hero list: {order.get('order_no')}")
-        
-        print(f"Hero orders: {len(hero_orders)} (all have system='hero')")
-        
-        # Get TVS orders
-        response = requests.get(
-            f"{BASE_URL}/orders",
-            params={"system": "tvs"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"TVS orders fetch failed with status {response.status_code}: {response.text}")
-        
-        tvs_orders = response.json()
-        
-        # Check all orders are tvs system
-        for order in tvs_orders:
-            if order.get("system") != "tvs":
-                return print_result(False, f"Found non-tvs order in tvs list: {order.get('order_no')}")
-        
-        print(f"TVS orders: {len(tvs_orders)} (all have system='tvs')")
-        
-        return print_result(True, "Order filtering by system works correctly")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_8_permission_keys():
-    """Test 8: Get permission keys"""
-    print_test("8. Permission Keys - Get list of permission keys")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        response = requests.get(
-            f"{BASE_URL}/permissions/keys",
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"Failed with status {response.status_code}: {response.text}")
-        
-        data = response.json()
-        
-        if "keys" not in data:
-            return print_result(False, "Missing 'keys' in response")
-        
-        keys = data["keys"]
-        
-        if len(keys) != 10:
-            return print_result(False, f"Expected 10 permission keys, got {len(keys)}")
-        
-        print(f"Permission keys: {len(keys)}")
-        for key in keys:
-            print(f"  - {key.get('key')}: {key.get('label')}")
-        
-        return print_result(True, "Permission keys retrieved successfully")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_9_employee_create():
-    """Test 9: Create employee with limited permissions"""
-    global employee_id
-    
-    print_test("9. Employee CRUD - Create employee")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        employee_body = {
-            "username": "tvsemp1",
-            "password": "tvspass123",
-            "systems": ["tvs"],
-            "permissions": {
-                "orders_create_edit": True,
-                "search_ecatalogue": True,
-                "inventory_view": True
+    # Create Hero order
+    log("4.1: Create Hero order with item (MRP=100)")
+    hero_order_data = {
+        "items": [
+            {
+                "part_no": "HEROPART1",
+                "description": "Hero Test Part",
+                "mrp": 100.0,
+                "qty": 2
             }
-        }
-        
-        response = requests.post(
-            f"{BASE_URL}/employees",
-            headers=headers,
-            json=employee_body,
-            timeout=30
-        )
-        
-        if response.status_code not in [200, 201]:
-            return print_result(False, f"Employee creation failed with status {response.status_code}: {response.text}")
-        
-        employee = response.json()
-        employee_id = employee.get("id")
-        
-        if employee.get("role") != "employee":
-            return print_result(False, f"Expected role='employee', got '{employee.get('role')}'")
-        
-        if employee.get("systems") != ["tvs"]:
-            return print_result(False, f"Expected systems=['tvs'], got {employee.get('systems')}")
-        
-        print(f"Employee created: {employee.get('username')} (ID: {employee_id})")
-        print(f"Systems: {employee.get('systems')}")
-        print(f"Permissions: {employee.get('permissions')}")
-        
-        return print_result(True, "Employee created successfully")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
+        ],
+        "remarks": "Test Hero order"
+    }
+    resp = requests.post(f"{BASE_URL}/orders?system=hero",
+                        headers=headers(),
+                        json=hero_order_data)
+    assert resp.status_code == 200, f"Failed to create Hero order: {resp.status_code} {resp.text}"
+    hero_order = resp.json()
+    hero_order_id = hero_order["id"]
+    
+    # Verify Hero order uses 25% discount
+    hero_item = hero_order["items"][0]
+    log(f"   Hero order item: discount_percent={hero_item.get('discount_percent')}, "
+        f"landed_price={hero_item.get('landed_price')}, line_total={hero_item.get('line_total')}")
+    
+    assert hero_item["discount_percent"] == 25, f"Expected Hero discount=25%, got {hero_item['discount_percent']}"
+    expected_landed = round(100 * (1 - 0.25), 2)  # 75.0
+    assert hero_item["landed_price"] == expected_landed, f"Expected landed_price={expected_landed}, got {hero_item['landed_price']}"
+    expected_line_total = round(expected_landed * 2, 2)  # 150.0
+    assert hero_item["line_total"] == expected_line_total, f"Expected line_total={expected_line_total}, got {hero_item['line_total']}"
+    log(f"✅ Hero order uses Hero DLP (25%): landed_price=75.0, line_total=150.0")
+    
+    # Create TVS order
+    log("4.2: Create TVS order with item (MRP=100)")
+    tvs_order_data = {
+        "items": [
+            {
+                "part_no": "TVSPART1",
+                "description": "TVS Test Part",
+                "mrp": 100.0,
+                "qty": 2
+            }
+        ],
+        "remarks": "Test TVS order"
+    }
+    resp = requests.post(f"{BASE_URL}/orders?system=tvs",
+                        headers=headers(),
+                        json=tvs_order_data)
+    assert resp.status_code == 200, f"Failed to create TVS order: {resp.status_code} {resp.text}"
+    tvs_order = resp.json()
+    tvs_order_id = tvs_order["id"]
+    
+    # Verify TVS order uses 10% discount
+    tvs_item = tvs_order["items"][0]
+    log(f"   TVS order item: discount_percent={tvs_item.get('discount_percent')}, "
+        f"landed_price={tvs_item.get('landed_price')}, line_total={tvs_item.get('line_total')}")
+    
+    assert tvs_item["discount_percent"] == 10, f"Expected TVS discount=10%, got {tvs_item['discount_percent']}"
+    expected_landed = round(100 * (1 - 0.10), 2)  # 90.0
+    assert tvs_item["landed_price"] == expected_landed, f"Expected landed_price={expected_landed}, got {tvs_item['landed_price']}"
+    expected_line_total = round(expected_landed * 2, 2)  # 180.0
+    assert tvs_item["line_total"] == expected_line_total, f"Expected line_total={expected_line_total}, got {tvs_item['line_total']}"
+    log(f"✅ TVS order uses TVS DLP (10%): landed_price=90.0, line_total=180.0")
+    
+    return hero_order_id, tvs_order_id
 
-def test_10_employee_login():
-    """Test 10: Login as employee and verify permissions"""
-    global employee_token
+def test_add_items_endpoint(hero_order_id):
+    """Test 3: Add-items endpoint"""
+    log("\n=== TEST 5: Add-Items Endpoint ===")
     
-    print_test("10. Employee Login - Login as tvsemp1")
+    # Add items to Hero order
+    log("5.1: Add item to Hero draft order")
+    add_items_data = {
+        "items": [
+            {
+                "part_no": "TESTPART1",
+                "description": "Test Part 1",
+                "mrp": 100.0,
+                "qty": 2
+            }
+        ]
+    }
+    resp = requests.post(f"{BASE_URL}/orders/{hero_order_id}/add-items",
+                        headers=headers(),
+                        json=add_items_data)
+    assert resp.status_code == 200, f"Failed to add items: {resp.status_code} {resp.text}"
+    data = resp.json()
     
-    try:
-        response = requests.post(
-            f"{BASE_URL}/auth/login",
-            json={"username": "tvsemp1", "password": "tvspass123"},
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"Login failed with status {response.status_code}: {response.text}")
-        
-        data = response.json()
-        employee_token = data.get("access_token")
-        user = data.get("user", {})
-        
-        if user.get("role") != "employee":
-            return print_result(False, f"Expected role='employee', got '{user.get('role')}'")
-        
-        if user.get("systems") != ["tvs"]:
-            return print_result(False, f"Expected systems=['tvs'], got {user.get('systems')}")
-        
-        # Check only requested permissions are true
-        permissions = user.get("permissions", {})
-        
-        if not permissions.get("orders_create_edit"):
-            return print_result(False, "orders_create_edit should be true")
-        
-        if not permissions.get("search_ecatalogue"):
-            return print_result(False, "search_ecatalogue should be true")
-        
-        if not permissions.get("inventory_view"):
-            return print_result(False, "inventory_view should be true")
-        
-        # Check other permissions are false
-        if permissions.get("orders_delete"):
-            return print_result(False, "orders_delete should be false")
-        
-        print(f"Employee token: {employee_token[:20]}...")
-        print(f"Role: {user.get('role')}, Systems: {user.get('systems')}")
-        
-        return print_result(True, "Employee login successful with correct permissions")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
+    log(f"   Response: added={data.get('added')}, total items={len(data.get('order', {}).get('items', []))}")
+    assert data["added"] == 1, f"Expected added=1, got {data['added']}"
+    
+    # Verify the item was added with correct discount
+    order = data["order"]
+    added_item = None
+    for item in order["items"]:
+        if item["part_no"] == "TESTPART1":
+            added_item = item
+            break
+    
+    assert added_item is not None, "Added item not found in order"
+    assert added_item["discount_percent"] == 25, f"Expected discount=25%, got {added_item['discount_percent']}"
+    expected_landed = round(100 * (1 - 0.25), 2)  # 75.0
+    assert added_item["landed_price"] == expected_landed, f"Expected landed_price={expected_landed}, got {added_item['landed_price']}"
+    log(f"✅ Item added successfully with Hero DLP (25%): landed_price=75.0")
+    
+    # Try adding the same part again (should dedupe)
+    log("5.2: Try adding same part again (dedupe test)")
+    resp = requests.post(f"{BASE_URL}/orders/{hero_order_id}/add-items",
+                        headers=headers(),
+                        json=add_items_data)
+    assert resp.status_code == 200, f"Failed to add items: {resp.status_code} {resp.text}"
+    data = resp.json()
+    
+    log(f"   Response: added={data.get('added')}")
+    assert data["added"] == 0, f"Expected added=0 (dedupe), got {data['added']}"
+    log(f"✅ Dedupe working: added=0 for duplicate part")
+    
+    # Mark order as sent
+    log("5.3: Mark order as sent")
+    resp = requests.post(f"{BASE_URL}/orders/{hero_order_id}/mark-sent",
+                        headers=headers())
+    assert resp.status_code == 200, f"Failed to mark order sent: {resp.status_code} {resp.text}"
+    log(f"✅ Order marked as sent")
+    
+    # Try adding items to sent order (should fail with 400)
+    log("5.4: Try adding items to sent order (should fail)")
+    add_items_data2 = {
+        "items": [
+            {
+                "part_no": "TESTPART2",
+                "description": "Test Part 2",
+                "mrp": 50.0,
+                "qty": 1
+            }
+        ]
+    }
+    resp = requests.post(f"{BASE_URL}/orders/{hero_order_id}/add-items",
+                        headers=headers(),
+                        json=add_items_data2)
+    assert resp.status_code == 400, f"Expected 400 for sent order, got {resp.status_code}"
+    log(f"✅ Correctly rejected add-items to sent order with 400")
 
-def test_11_employee_tvs_search_allowed():
-    """Test 11: Employee can search TVS (has permission and system access)"""
-    print_test("11. Employee Permission - TVS search allowed")
+def test_mandatory_parts_threshold():
+    """Test 4: Mandatory parts threshold + low-stock flag"""
+    log("\n=== TEST 6: Mandatory Parts Threshold + Low-Stock ===")
     
-    try:
-        headers = {"Authorization": f"Bearer {employee_token}"}
-        
-        response = requests.get(
-            f"{BASE_URL}/tvs/search",
-            params={"q": "N3012050"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code == 502:
-            print("⚠️  WARNING: TVS eCatalogue unreachable (502)")
-            return print_result(True, "TVS eCatalogue unreachable - acceptable")
-        
-        if response.status_code != 200:
-            return print_result(False, f"TVS search failed with status {response.status_code}: {response.text}")
-        
-        return print_result(True, "Employee can search TVS (has permission and system access)")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_12_employee_hero_search_forbidden():
-    """Test 12: Employee cannot search Hero (no system access)"""
-    print_test("12. Employee Permission - Hero search forbidden")
+    # Clean up existing mandatory parts first
+    log("6.0: Cleanup existing mandatory parts")
+    resp = requests.get(f"{BASE_URL}/mandatory-parts?system=hero", headers=headers())
+    if resp.status_code == 200:
+        data = resp.json()
+        for part in data.get("parts", []):
+            if part.get("part_no") in ["MANDLOW1", "MANDLOW1S", "MANDOK1", "MANDOK1S"]:
+                part_id = part.get("id")
+                requests.delete(f"{BASE_URL}/mandatory-parts/{part_id}", headers=headers())
+                log(f"   Deleted existing mandatory part: {part['part_no']}")
     
-    try:
-        headers = {"Authorization": f"Bearer {employee_token}"}
-        
-        response = requests.get(
-            f"{BASE_URL}/hero/search",
-            params={"q": "23121KST901"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 403:
-            return print_result(False, f"Expected 403, got {response.status_code}: {response.text}")
-        
-        return print_result(True, "Employee correctly denied Hero system access (403)")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_13_employee_create_employee_forbidden():
-    """Test 13: Employee cannot create other employees (owner-only)"""
-    print_test("13. Employee Permission - Cannot create employees")
+    # Create mandatory part with high threshold (should be low stock)
+    log("6.1: Create mandatory part with threshold_qty=999, qty=1 (should be low)")
+    mand_low_data = {
+        "part_no": "MANDLOW1",
+        "description": "Mandatory Low Stock Part",
+        "mrp": 50.0,
+        "qty": 1,
+        "threshold_qty": 999
+    }
+    resp = requests.post(f"{BASE_URL}/mandatory-parts?system=hero",
+                        headers=headers(),
+                        json=mand_low_data)
+    assert resp.status_code == 200, f"Failed to create mandatory part: {resp.status_code} {resp.text}"
+    mand_low = resp.json()
+    log(f"✅ Mandatory part created: {mand_low['part_no']}, threshold_qty={mand_low['threshold_qty']}")
     
-    try:
-        headers = {"Authorization": f"Bearer {employee_token}"}
-        
-        body = {
-            "username": "test123",
-            "password": "test123",
-            "systems": ["hero"],
-            "permissions": {}
-        }
-        
-        response = requests.post(
-            f"{BASE_URL}/employees",
-            headers=headers,
-            json=body,
-            timeout=30
-        )
-        
-        if response.status_code != 403:
-            return print_result(False, f"Expected 403, got {response.status_code}: {response.text}")
-        
-        return print_result(True, "Employee correctly denied employee creation (403)")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_14_employee_delete_order_forbidden():
-    """Test 14: Employee cannot delete orders (no permission and no system access)"""
-    print_test("14. Employee Permission - Cannot delete Hero order")
+    # Get mandatory parts and check is_low flag
+    log("6.2: GET /api/mandatory-parts?system=hero - check is_low=true")
+    resp = requests.get(f"{BASE_URL}/mandatory-parts?system=hero", headers=headers())
+    assert resp.status_code == 200, f"Failed to get mandatory parts: {resp.status_code} {resp.text}"
+    data = resp.json()
     
-    try:
-        headers = {"Authorization": f"Bearer {employee_token}"}
-        
-        response = requests.delete(
-            f"{BASE_URL}/orders/{hero_order_id}",
-            params={"confirm": "delete"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 403:
-            return print_result(False, f"Expected 403, got {response.status_code}: {response.text}")
-        
-        return print_result(True, "Employee correctly denied order deletion (403)")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_15_owner_delete_employee():
-    """Test 15: Owner can delete employee"""
-    print_test("15. Employee CRUD - Owner deletes employee")
+    parts = data.get("parts", [])
+    mandlow_part = None
+    for p in parts:
+        # Hero parts get 'S' suffix, so check for both MANDLOW1 and MANDLOW1S
+        if p.get("part_no") in ["MANDLOW1", "MANDLOW1S"]:
+            mandlow_part = p
+            break
     
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        response = requests.delete(
-            f"{BASE_URL}/employees/{employee_id}",
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"Delete failed with status {response.status_code}: {response.text}")
-        
-        data = response.json()
-        
-        if not data.get("success"):
-            return print_result(False, "Delete did not return success=true")
-        
-        return print_result(True, "Employee deleted successfully")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_16_important_parts_hero():
-    """Test 16: Create important part for Hero system"""
-    global hero_important_part_id
+    assert mandlow_part is not None, f"MANDLOW1/MANDLOW1S not found in mandatory parts. Found: {[p.get('part_no') for p in parts]}"
+    log(f"   {mandlow_part['part_no']}: current_stock={mandlow_part.get('current_stock')}, "
+        f"threshold_qty={mandlow_part.get('threshold_qty')}, is_low={mandlow_part.get('is_low')}")
     
-    print_test("16. Important Parts - Create Hero important part")
+    assert "current_stock" in mandlow_part, "current_stock not present"
+    assert mandlow_part["current_stock"] == 1.0, f"Expected current_stock=1.0, got {mandlow_part['current_stock']}"
+    assert mandlow_part["threshold_qty"] == 999.0, f"Expected threshold_qty=999, got {mandlow_part['threshold_qty']}"
+    assert mandlow_part["is_low"] == True, f"Expected is_low=true (stock 1 < threshold 999), got {mandlow_part['is_low']}"
+    log(f"✅ MANDLOW1 correctly flagged as low stock: is_low=true")
     
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        body = {
-            "part_no": "23121KST901",
-            "description": "Sample Hero Part",
-            "threshold_qty": 5
-        }
-        
-        response = requests.post(
-            f"{BASE_URL}/important-parts",
-            params={"system": "hero"},
-            headers=headers,
-            json=body,
-            timeout=30
-        )
-        
-        if response.status_code not in [200, 201]:
-            return print_result(False, f"Creation failed with status {response.status_code}: {response.text}")
-        
-        part = response.json()
-        hero_important_part_id = part.get("id")
-        
-        if part.get("system") != "hero":
-            return print_result(False, f"Expected system='hero', got '{part.get('system')}'")
-        
-        print(f"Hero important part created: {part.get('part_no')} (ID: {hero_important_part_id})")
-        
-        return print_result(True, "Hero important part created successfully")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_17_important_parts_tvs():
-    """Test 17: Create important part for TVS system"""
-    global tvs_important_part_id
+    # Create mandatory part with threshold_qty=0 (should not be low)
+    log("6.3: Create mandatory part with threshold_qty=0 (should not be low)")
+    mand_ok_data = {
+        "part_no": "MANDOK1",
+        "description": "Mandatory OK Stock Part",
+        "mrp": 75.0,
+        "qty": 1,
+        "threshold_qty": 0
+    }
+    resp = requests.post(f"{BASE_URL}/mandatory-parts?system=hero",
+                        headers=headers(),
+                        json=mand_ok_data)
+    assert resp.status_code == 200, f"Failed to create mandatory part: {resp.status_code} {resp.text}"
+    mand_ok = resp.json()
+    log(f"✅ Mandatory part created: {mand_ok['part_no']}, threshold_qty={mand_ok['threshold_qty']}")
     
-    print_test("17. Important Parts - Create TVS important part")
+    # Get mandatory parts and check is_low flag
+    log("6.4: GET /api/mandatory-parts?system=hero - check is_low=false for threshold_qty=0")
+    resp = requests.get(f"{BASE_URL}/mandatory-parts?system=hero", headers=headers())
+    assert resp.status_code == 200, f"Failed to get mandatory parts: {resp.status_code} {resp.text}"
+    data = resp.json()
     
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        body = {
-            "part_no": "N3012050",
-            "description": "VALVE STEM OIL SEAL",
-            "threshold_qty": 2
-        }
-        
-        response = requests.post(
-            f"{BASE_URL}/important-parts",
-            params={"system": "tvs"},
-            headers=headers,
-            json=body,
-            timeout=30
-        )
-        
-        if response.status_code not in [200, 201]:
-            return print_result(False, f"Creation failed with status {response.status_code}: {response.text}")
-        
-        part = response.json()
-        tvs_important_part_id = part.get("id")
-        
-        if part.get("system") != "tvs":
-            return print_result(False, f"Expected system='tvs', got '{part.get('system')}'")
-        
-        print(f"TVS important part created: {part.get('part_no')} (ID: {tvs_important_part_id})")
-        
-        return print_result(True, "TVS important part created successfully")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_18_important_parts_filter():
-    """Test 18: Filter important parts by system"""
-    print_test("18. Important Parts - Filter by system")
+    parts = data.get("parts", [])
+    mandok_part = None
+    for p in parts:
+        # Hero parts get 'S' suffix, so check for both MANDOK1 and MANDOK1S
+        if p.get("part_no") in ["MANDOK1", "MANDOK1S"]:
+            mandok_part = p
+            break
     
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        # Get Hero important parts
-        response = requests.get(
-            f"{BASE_URL}/important-parts",
-            params={"system": "hero"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"Hero fetch failed with status {response.status_code}: {response.text}")
-        
-        hero_parts = response.json()
-        
-        # Check all are hero system
-        for part in hero_parts:
-            if part.get("system") != "hero":
-                return print_result(False, f"Found non-hero part in hero list: {part.get('part_no')}")
-        
-        print(f"Hero important parts: {len(hero_parts)}")
-        
-        # Get TVS important parts
-        response = requests.get(
-            f"{BASE_URL}/important-parts",
-            params={"system": "tvs"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"TVS fetch failed with status {response.status_code}: {response.text}")
-        
-        tvs_parts = response.json()
-        
-        # Check all are tvs system
-        for part in tvs_parts:
-            if part.get("system") != "tvs":
-                return print_result(False, f"Found non-tvs part in tvs list: {part.get('part_no')}")
-        
-        print(f"TVS important parts: {len(tvs_parts)}")
-        
-        return print_result(True, "Important parts filtering by system works correctly")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_19_mandatory_parts_hero():
-    """Test 19: Create mandatory part for Hero system"""
-    global hero_mandatory_part_id
+    assert mandok_part is not None, f"MANDOK1/MANDOK1S not found in mandatory parts. Found: {[p.get('part_no') for p in parts]}"
+    log(f"   {mandok_part['part_no']}: current_stock={mandok_part.get('current_stock')}, "
+        f"threshold_qty={mandok_part.get('threshold_qty')}, is_low={mandok_part.get('is_low')}")
     
-    print_test("19. Mandatory Parts - Create Hero mandatory part")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        body = {
-            "part_no": "23121KST901",
-            "description": "Sample Hero Part",
-            "mrp": 100,
-            "qty": 1
-        }
-        
-        response = requests.post(
-            f"{BASE_URL}/mandatory-parts",
-            params={"system": "hero"},
-            headers=headers,
-            json=body,
-            timeout=30
-        )
-        
-        if response.status_code not in [200, 201]:
-            return print_result(False, f"Creation failed with status {response.status_code}: {response.text}")
-        
-        part = response.json()
-        hero_mandatory_part_id = part.get("id")
-        
-        if part.get("system") != "hero":
-            return print_result(False, f"Expected system='hero', got '{part.get('system')}'")
-        
-        print(f"Hero mandatory part created: {part.get('part_no')} (ID: {hero_mandatory_part_id})")
-        
-        return print_result(True, "Hero mandatory part created successfully")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_20_mandatory_parts_tvs():
-    """Test 20: Create mandatory part for TVS system"""
-    global tvs_mandatory_part_id
-    
-    print_test("20. Mandatory Parts - Create TVS mandatory part")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        body = {
-            "part_no": "N3012050",
-            "description": "VALVE STEM OIL SEAL",
-            "mrp": 80,
-            "qty": 1
-        }
-        
-        response = requests.post(
-            f"{BASE_URL}/mandatory-parts",
-            params={"system": "tvs"},
-            headers=headers,
-            json=body,
-            timeout=30
-        )
-        
-        if response.status_code not in [200, 201]:
-            return print_result(False, f"Creation failed with status {response.status_code}: {response.text}")
-        
-        part = response.json()
-        tvs_mandatory_part_id = part.get("id")
-        
-        if part.get("system") != "tvs":
-            return print_result(False, f"Expected system='tvs', got '{part.get('system')}'")
-        
-        print(f"TVS mandatory part created: {part.get('part_no')} (ID: {tvs_mandatory_part_id})")
-        
-        return print_result(True, "TVS mandatory part created successfully")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_21_mandatory_parts_filter():
-    """Test 21: Filter mandatory parts by system"""
-    print_test("21. Mandatory Parts - Filter by system")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        # Get Hero mandatory parts
-        response = requests.get(
-            f"{BASE_URL}/mandatory-parts",
-            params={"system": "hero"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"Hero fetch failed with status {response.status_code}: {response.text}")
-        
-        data = response.json()
-        hero_parts = data.get("parts", [])
-        
-        # Check all are hero system
-        for part in hero_parts:
-            if part.get("system") != "hero":
-                return print_result(False, f"Found non-hero part in hero list: {part.get('part_no')}")
-        
-        print(f"Hero mandatory parts: {len(hero_parts)}")
-        
-        # Get TVS mandatory parts
-        response = requests.get(
-            f"{BASE_URL}/mandatory-parts",
-            params={"system": "tvs"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"TVS fetch failed with status {response.status_code}: {response.text}")
-        
-        data = response.json()
-        tvs_parts = data.get("parts", [])
-        
-        # Check all are tvs system
-        for part in tvs_parts:
-            if part.get("system") != "tvs":
-                return print_result(False, f"Found non-tvs part in tvs list: {part.get('part_no')}")
-        
-        print(f"TVS mandatory parts: {len(tvs_parts)}")
-        
-        return print_result(True, "Mandatory parts filtering by system works correctly")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_22_dashboard_stats_hero():
-    """Test 22: Dashboard stats for Hero system"""
-    print_test("22. Dashboard Stats - Hero system")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        response = requests.get(
-            f"{BASE_URL}/dashboard/stats",
-            params={"system": "hero"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"Failed with status {response.status_code}: {response.text}")
-        
-        stats = response.json()
-        
-        if stats.get("system") != "hero":
-            return print_result(False, f"Expected system='hero', got '{stats.get('system')}'")
-        
-        print(f"Hero stats: current_orders={stats.get('current_orders')}, sent_orders={stats.get('sent_orders')}")
-        
-        return print_result(True, "Hero dashboard stats retrieved successfully")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_23_dashboard_stats_tvs():
-    """Test 23: Dashboard stats for TVS system"""
-    print_test("23. Dashboard Stats - TVS system")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        response = requests.get(
-            f"{BASE_URL}/dashboard/stats",
-            params={"system": "tvs"},
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"Failed with status {response.status_code}: {response.text}")
-        
-        stats = response.json()
-        
-        if stats.get("system") != "tvs":
-            return print_result(False, f"Expected system='tvs', got '{stats.get('system')}'")
-        
-        print(f"TVS stats: current_orders={stats.get('current_orders')}, sent_orders={stats.get('sent_orders')}")
-        
-        return print_result(True, "TVS dashboard stats retrieved successfully")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_24_inventory_lookup():
-    """Test 24: Legacy compatibility - Inventory lookup"""
-    print_test("24. Legacy Compatibility - Inventory lookup")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        response = requests.get(
-            f"{BASE_URL}/inventory/lookup/N3012050",
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"Failed with status {response.status_code}: {response.text}")
-        
-        data = response.json()
-        
-        if not data.get("found"):
-            return print_result(False, "Part not found in inventory")
-        
-        print(f"Found part: {data.get('part_no')} - Stock: {data.get('stock_qty')}")
-        
-        return print_result(True, "Inventory lookup working")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
-
-def test_25_inventory_mapping():
-    """Test 25: Legacy compatibility - Inventory mapping"""
-    print_test("25. Legacy Compatibility - Inventory mapping")
-    
-    try:
-        headers = {"Authorization": f"Bearer {owner_token}"}
-        
-        # GET mapping
-        response = requests.get(
-            f"{BASE_URL}/inventory/mapping",
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"GET failed with status {response.status_code}: {response.text}")
-        
-        mapping = response.json()
-        print(f"Current mapping: {mapping}")
-        
-        # PUT mapping (update)
-        new_mapping = {
-            "part_no": "Part No",
-            "description": "Description",
-            "stock_qty": "Stock Qty",
-            "location": "",
-            "rate": ""
-        }
-        
-        response = requests.put(
-            f"{BASE_URL}/inventory/mapping",
-            headers=headers,
-            json=new_mapping,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return print_result(False, f"PUT failed with status {response.status_code}: {response.text}")
-        
-        return print_result(True, "Inventory mapping GET/PUT working")
-        
-    except Exception as e:
-        return print_result(False, f"Exception: {str(e)}")
+    assert "current_stock" in mandok_part, "current_stock not present"
+    assert mandok_part["current_stock"] == 500.0, f"Expected current_stock=500.0, got {mandok_part['current_stock']}"
+    assert mandok_part["threshold_qty"] == 0.0, f"Expected threshold_qty=0, got {mandok_part['threshold_qty']}"
+    assert mandok_part["is_low"] == False, f"Expected is_low=false (threshold_qty=0), got {mandok_part['is_low']}"
+    log(f"✅ MANDOK1 correctly NOT flagged as low stock: is_low=false")
 
 def main():
     """Run all tests"""
-    print("\n" + "="*80)
-    print("BACKEND API TESTING - Hero + TVS Parts Ordering System")
-    print("="*80)
-    print(f"Backend URL: {BASE_URL}")
-    print(f"Owner credentials: {OWNER_USERNAME}/{OWNER_PASSWORD}")
+    print("=" * 80)
+    print("BACKEND API TESTING - Hero/TVS Parts Ordering App")
+    print("Testing: Per-system DLP, Add-items endpoint, Mandatory parts threshold")
+    print("=" * 80)
     
-    results = []
-    
-    # Run all tests in order
-    results.append(test_1_auth_login())
-    results.append(test_2_inventory_freshness_gate())
-    results.append(test_3_inventory_upload())
-    results.append(test_4_tvs_ecatalogue_search())
-    results.append(test_5_hero_ecatalogue_search())
-    results.append(test_6_system_scoped_orders_create())
-    results.append(test_7_system_scoped_orders_filter())
-    results.append(test_8_permission_keys())
-    results.append(test_9_employee_create())
-    results.append(test_10_employee_login())
-    results.append(test_11_employee_tvs_search_allowed())
-    results.append(test_12_employee_hero_search_forbidden())
-    results.append(test_13_employee_create_employee_forbidden())
-    results.append(test_14_employee_delete_order_forbidden())
-    results.append(test_15_owner_delete_employee())
-    results.append(test_16_important_parts_hero())
-    results.append(test_17_important_parts_tvs())
-    results.append(test_18_important_parts_filter())
-    results.append(test_19_mandatory_parts_hero())
-    results.append(test_20_mandatory_parts_tvs())
-    results.append(test_21_mandatory_parts_filter())
-    results.append(test_22_dashboard_stats_hero())
-    results.append(test_23_dashboard_stats_tvs())
-    results.append(test_24_inventory_lookup())
-    results.append(test_25_inventory_mapping())
-    
-    # Summary
-    print("\n" + "="*80)
-    print("TEST SUMMARY")
-    print("="*80)
-    
-    passed = sum(results)
-    total = len(results)
-    
-    print(f"\nTotal: {total} tests")
-    print(f"Passed: {passed} ✅")
-    print(f"Failed: {total - passed} ❌")
-    print(f"Success rate: {passed/total*100:.1f}%")
-    
-    if passed == total:
-        print("\n🎉 ALL TESTS PASSED!")
-        return 0
-    else:
-        print(f"\n⚠️  {total - passed} test(s) failed")
-        return 1
+    try:
+        # Login
+        login()
+        
+        # Upload inventory
+        upload_inventory()
+        
+        # Test per-system DLP
+        test_per_system_dlp()
+        
+        # Test order uses system DLP
+        hero_order_id, tvs_order_id = test_order_uses_system_dlp()
+        
+        # Test add-items endpoint
+        test_add_items_endpoint(hero_order_id)
+        
+        # Test mandatory parts threshold
+        test_mandatory_parts_threshold()
+        
+        print("\n" + "=" * 80)
+        print("✅ ALL TESTS PASSED")
+        print("=" * 80)
+        
+    except AssertionError as e:
+        print(f"\n❌ TEST FAILED: {e}")
+        raise
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        raise
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
