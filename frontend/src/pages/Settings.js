@@ -125,25 +125,51 @@ export default function Settings() {
     if (!file) return;
     try {
       const text = await file.text();
-      const parsed = JSON.parse(text);
-      if (parsed?.app !== "hero-parts-ordering") {
-        toast.error("Not a Hero Parts Ordering backup file.");
-        if (dbFileRef.current) dbFileRef.current.value = "";
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null; // possibly truncated — we'll let the server repair it
+      }
+
+      if (parsed) {
+        if (parsed?.app !== "hero-parts-ordering") {
+          toast.error("Not a Hero Parts Ordering backup file.");
+          if (dbFileRef.current) dbFileRef.current.value = "";
+          return;
+        }
+        const counts = Object.entries(parsed.collections || {}).map(
+          ([k, v]) => [k, Array.isArray(v) ? v.length : 0],
+        );
+        setImportPreview({
+          file,
+          meta: {
+            exported_at: parsed.exported_at,
+            exported_by: parsed.exported_by,
+            counts,
+            truncated: false,
+          },
+        });
         return;
       }
-      const counts = Object.entries(parsed.collections || {}).map(
-        ([k, v]) => [k, Array.isArray(v) ? v.length : 0],
-      );
-      setImportPreview({
-        file,
-        meta: {
-          exported_at: parsed.exported_at,
-          exported_by: parsed.exported_by,
-          counts,
-        },
-      });
+
+      // Could not parse strictly. If it still looks like our backup, allow the
+      // server to auto-repair a truncated download instead of blocking.
+      if (text.includes('"hero-parts-ordering"')) {
+        setImportPreview({
+          file,
+          meta: { exported_at: null, exported_by: null, counts: [], truncated: true },
+        });
+        toast.warning(
+          "This backup looks incomplete/truncated — we'll try to repair it and restore what we can.",
+        );
+        return;
+      }
+
+      toast.error("Could not read backup file. Is it a valid Hero Parts Ordering backup?");
+      if (dbFileRef.current) dbFileRef.current.value = "";
     } catch (err) {
-      toast.error("Could not read backup file. Is it valid JSON?");
+      toast.error("Could not read backup file.");
       if (dbFileRef.current) dbFileRef.current.value = "";
     }
   };
@@ -157,11 +183,14 @@ export default function Settings() {
       const { data } = await api.post("/db/import", fd, {
         headers: { "Content-Type": "multipart/form-data" },
       });
-      toast.success(
-        `Restored: ${Object.entries(data.imported || {})
-          .map(([k, n]) => `${k} ${n}`)
-          .join(" · ")}`,
-      );
+      const summary = Object.entries(data.imported || {})
+        .map(([k, n]) => `${k} ${n}`)
+        .join(" · ");
+      if (data.recovered) {
+        toast.warning(`Repaired & restored: ${summary}. Some trailing records may be missing.`);
+      } else {
+        toast.success(`Restored: ${summary}`);
+      }
       setImportPreview(null);
       if (dbFileRef.current) dbFileRef.current.value = "";
       // Force sign-out because users collection may have been replaced
@@ -416,15 +445,24 @@ export default function Settings() {
               <div className="mt-2">
                 <b>Collections:</b>
                 <div className="mt-1">
-                  {importPreview.meta.counts.map(([k, n]) => (
+                  {importPreview.meta.truncated ? (
                     <span
-                      key={k}
-                      className="badge"
+                      className="badge badge-stock-low"
                       style={{ marginRight: 6, marginBottom: 6 }}
                     >
-                      {k} · {n}
+                      file incomplete — will auto-repair &amp; restore recoverable records
                     </span>
-                  ))}
+                  ) : (
+                    importPreview.meta.counts.map(([k, n]) => (
+                      <span
+                        key={k}
+                        className="badge"
+                        style={{ marginRight: 6, marginBottom: 6 }}
+                      >
+                        {k} · {n}
+                      </span>
+                    ))
+                  )}
                 </div>
               </div>
             </div>

@@ -200,9 +200,11 @@ export default function OrderEditor() {
         setManualOpen(true);
       } else {
         setSearchResults(data.parts);
-        // check duplicate & previous
-        const firstPart = data.parts[0].part_no;
-        checkPartHistory(firstPart);
+        // Pre-check the first result to surface any recent-sent warning early.
+        const firstPart = formatPartNoForSystem(data.parts[0].part_no, meta?.key);
+        fetchPartStatus(firstPart).then((s) => {
+          if (s?.recent_sent) setPreviouslyOrdered(s);
+        });
       }
     } catch (err) {
       setSearchError(
@@ -229,7 +231,7 @@ export default function OrderEditor() {
     setManualOpen(true);
   };
 
-  const addManualPart = () => {
+  const addManualPart = async () => {
     const raw = manualForm.part_no.trim();
     if (!raw) {
       toast.error("Part number is required");
@@ -239,6 +241,12 @@ export default function OrderEditor() {
     const norm = partNoKey(pn);
     if (items.some((it) => partNoKey(it.part_no) === norm)) {
       toast.error(`Duplicate: ${pn} is already in this order.`);
+      return;
+    }
+    // Block if the part is already in another current order.
+    const status = await fetchPartStatus(pn);
+    if (status?.blocked) {
+      toast.error(blockMessage(pn, status.current_order));
       return;
     }
     const newItem = recomputeItem({
@@ -256,35 +264,28 @@ export default function OrderEditor() {
     setSearchError("");
     setManualForm({ part_no: "", description: "", mrp: 0, moq: "", qty: 1 });
     toast.success(`Added ${pn} (manual)`);
-    // Warn if previously ordered
-    checkPartHistory(pn);
+    if (status?.recent_sent) setPreviouslyOrdered(status);
   };
 
-  const checkPartHistory = async (partNo) => {
-    if (!partNo) return;
-    const norm = partNoKey(partNo);
-    // duplicate in current order
-    const dup = items.find(
-      (it) => partNoKey(it.part_no) === norm,
-    );
-    if (dup) {
-      setDuplicateWarn(
-        `Part ${partNo} is already in this order (qty ${dup.qty}).`,
-      );
-    }
-    // previously ordered
+  const blockMessage = (pn, currentOrder) =>
+    `${pn} is already in current order ${currentOrder?.order_no || ""}. ` +
+    `A part can only be in one current order at a time.`;
+
+  // Fetch block/recent-sent status for a part from the backend.
+  const fetchPartStatus = async (partNo) => {
+    if (!partNo) return null;
     try {
       const excl = order?.id ? `?exclude_order_id=${order.id}` : "";
       const { data } = await api.get(
         `/orders/check-part/${encodeURIComponent(partNo)}${excl}`,
       );
-      if (data.previously_ordered) setPreviouslyOrdered(data);
+      return data;
     } catch (e) {
-      // ignore
+      return null; // fail-open on the client; backend still enforces on save
     }
   };
 
-  const addPart = (part, qtyOverride) => {
+  const addPart = async (part, qtyOverride) => {
     const formatted = formatPartNoForSystem(part.part_no, meta?.key);
     const norm = partNoKey(formatted);
     const exists = items.some(
@@ -292,6 +293,11 @@ export default function OrderEditor() {
     );
     if (exists) {
       toast.error(`Duplicate: ${formatted} is already in this order.`);
+      return;
+    }
+    const status = await fetchPartStatus(formatted);
+    if (status?.blocked) {
+      toast.error(blockMessage(formatted, status.current_order));
       return;
     }
     const qty = Math.max(1, Math.floor(Number(qtyOverride ?? addQty[part.part_no] ?? 1) || 1));
@@ -309,29 +315,46 @@ export default function OrderEditor() {
     setSearchResults([]);
     setSearchQuery("");
     setDuplicateWarn("");
-    setPreviouslyOrdered(null);
+    setPreviouslyOrdered(status?.recent_sent ? status : null);
     setAddQty({});
     toast.success(`Added ${formatted} × ${qty}`);
   };
 
   // Bulk add: add every checked search result (with its per-row qty) to the
-  // order in one action. Skips parts already in the order.
-  const addSelected = () => {
+  // order in one action. Skips parts already in this order or already sitting
+  // in another current order (blocked).
+  const addSelected = async () => {
     const chosen = searchResults.filter((p) => selected[p.part_no]);
     if (chosen.length === 0) {
       toast.error("Select at least one part first.");
       return;
     }
     const existingNorms = new Set(items.map((it) => partNoKey(it.part_no)));
+
+    // Check block status for all chosen parts in parallel.
+    const statuses = await Promise.all(
+      chosen.map((p) =>
+        fetchPartStatus(formatPartNoForSystem(p.part_no, meta?.key)),
+      ),
+    );
+
     const toAdd = [];
     let skipped = 0;
-    for (const p of chosen) {
+    const blocked = [];
+    let recentSentStatus = null;
+    chosen.forEach((p, i) => {
       const formatted = formatPartNoForSystem(p.part_no, meta?.key);
       const norm = partNoKey(formatted);
       if (existingNorms.has(norm)) {
         skipped += 1;
-        continue;
+        return;
       }
+      const status = statuses[i];
+      if (status?.blocked) {
+        blocked.push(`${formatted} (in ${status.current_order?.order_no || "another order"})`);
+        return;
+      }
+      if (status?.recent_sent && !recentSentStatus) recentSentStatus = status;
       existingNorms.add(norm);
       const qty = Math.max(
         1,
@@ -348,9 +371,15 @@ export default function OrderEditor() {
           discount_percent: Number(globalDiscount),
         }),
       );
+    });
+
+    if (blocked.length > 0) {
+      toast.error(
+        `Skipped ${blocked.length} already in another current order: ${blocked.join(", ")}`,
+      );
     }
     if (toAdd.length === 0) {
-      toast.error("All selected parts are already in this order.");
+      if (blocked.length === 0) toast.error("All selected parts are already in this order.");
       return;
     }
     setItems((prev) => [...prev, ...toAdd]);
@@ -359,7 +388,7 @@ export default function OrderEditor() {
     setSelected({});
     setAddQty({});
     setDuplicateWarn("");
-    setPreviouslyOrdered(null);
+    setPreviouslyOrdered(recentSentStatus);
     toast.success(
       `Added ${toAdd.length} part${toAdd.length > 1 ? "s" : ""}${skipped ? ` (${skipped} skipped as duplicates)` : ""}`,
     );
@@ -871,7 +900,7 @@ export default function OrderEditor() {
             </div>
           )}
 
-          {previouslyOrdered && previouslyOrdered.orders?.length > 0 && (
+          {previouslyOrdered && previouslyOrdered.recent_sent && (
             <div
               data-testid={IDS.editorPreviousWarning}
               className="mt-3 flex items-start gap-2"
@@ -886,9 +915,17 @@ export default function OrderEditor() {
             >
               <Warning size={14} />
               <div>
-                Part <b>{previouslyOrdered.part_no}</b> was in your last order sheet{" "}
-                <b>{previouslyOrdered.orders[0].order_no}</b>{" "}
-                ({previouslyOrdered.orders[0].status}, qty {previouslyOrdered.orders[0].qty}).
+                Heads up: <b>{previouslyOrdered.part_no}</b> was already ordered in
+                the last {previouslyOrdered.recent_sent_window_days || 7} days —
+                sent order{" "}
+                <b>{previouslyOrdered.recent_sent.order_no}</b>
+                {previouslyOrdered.recent_sent.qty != null
+                  ? ` (qty ${previouslyOrdered.recent_sent.qty})`
+                  : ""}
+                {previouslyOrdered.recent_sent.sent_at
+                  ? ` on ${new Date(previouslyOrdered.recent_sent.sent_at).toLocaleDateString()}`
+                  : ""}
+                . You can still add it if you need more.
               </div>
             </div>
           )}

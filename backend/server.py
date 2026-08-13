@@ -5,6 +5,7 @@ load_dotenv(ROOT_DIR / '.env')
 
 import os
 import io
+import json as _json_module
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -14,7 +15,7 @@ import bcrypt
 import jwt
 import requests
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -797,6 +798,12 @@ async def create_order(
     global_discount = await get_system_discount(system)
     items = await _resolve_new_order_items(body.items or [], global_discount, system)
 
+    # Enforce: a part cannot exist in more than one CURRENT order at a time.
+    new_norms = {normalize_part_no(it.get("part_no", "")) for it in items}
+    new_norms.discard("")
+    conflicts = await _find_current_order_conflicts(system, new_norms)
+    _assert_no_current_conflicts(conflicts)
+
     order = {
         "id": str(uuid.uuid4()),
         "order_no": await generate_order_no(system),
@@ -844,6 +851,12 @@ async def update_order(order_id: str, body: OrderUpdate, current_user: dict = De
     if not items:
         raise HTTPException(status_code=400, detail="Cannot save an empty order. Add at least one part.")
 
+    # Enforce: a part cannot exist in more than one CURRENT order at a time.
+    conflicts = await _find_current_order_conflicts(
+        order.get("system", "hero"), seen, exclude_order_id=order_id
+    )
+    _assert_no_current_conflicts(conflicts)
+
     await db.orders.update_one(
         {"id": order_id},
         {"$set": {"items": items, "remarks": body.remarks, "updated_at": now_iso()}},
@@ -872,6 +885,15 @@ async def add_items_to_order(
     global_discount = await get_system_discount(order.get("system", "hero"))
     items = list(order.get("items", []))
     seen = {normalize_part_no(i.get("part_no", "")) for i in items}
+
+    # Enforce: reject parts that already sit in ANOTHER current order.
+    incoming_norms = {normalize_part_no(it.part_no) for it in body.items}
+    incoming_norms.discard("")
+    conflicts = await _find_current_order_conflicts(
+        order.get("system", "hero"), incoming_norms, exclude_order_id=order_id
+    )
+    _assert_no_current_conflicts(conflicts)
+
     added = 0
     for it in body.items:
         d = it.model_dump()
@@ -942,6 +964,69 @@ async def delete_order(order_id: str, confirm: str = "", current_user: dict = De
     return {"success": True}
 
 
+RECENT_SENT_WINDOW_DAYS = 7
+
+
+async def _get_mandatory_norms(system: str) -> set:
+    """Return the set of normalized part numbers configured as MANDATORY for a
+    system. Mandatory parts are exempt from the one-current-order rule — they
+    may appear in every sheet. We include BOTH the stored part_no_norm and the
+    normalized display part_no, because order items carry the display form
+    (e.g. Hero appends a trailing 'S') which normalizes differently from the
+    raw entered value."""
+    norms = set()
+    async for d in db.mandatory_parts.find(
+        {"system": system}, {"_id": 0, "part_no_norm": 1, "part_no": 1}
+    ):
+        if d.get("part_no_norm"):
+            norms.add(d["part_no_norm"])
+        if d.get("part_no"):
+            norms.add(normalize_part_no(d["part_no"]))
+    return norms
+
+
+async def _find_current_order_conflicts(
+    system: str, norms: set, exclude_order_id: Optional[str] = None
+) -> Dict[str, dict]:
+    """Return {part_no_norm: {order_no, order_id}} for parts that already exist
+    in a DIFFERENT current (draft) order of the same system. Used to enforce the
+    rule that a part cannot sit in two current sheets at once. MANDATORY parts
+    are excluded — they are allowed in every sheet."""
+    if not norms:
+        return {}
+    mandatory = await _get_mandatory_norms(system)
+    check_norms = {n for n in norms if n and n not in mandatory}
+    if not check_norms:
+        return {}
+    query: dict = {"system": system, "status": "current"}
+    if exclude_order_id:
+        query["id"] = {"$ne": exclude_order_id}
+    conflicts: Dict[str, dict] = {}
+    async for o in db.orders.find(
+        query, {"_id": 0, "id": 1, "order_no": 1, "items": 1}
+    ):
+        for it in o.get("items", []):
+            n = normalize_part_no(it.get("part_no", ""))
+            if n in check_norms and n not in conflicts:
+                conflicts[n] = {"order_no": o["order_no"], "order_id": o["id"]}
+    return conflicts
+
+
+def _assert_no_current_conflicts(conflicts: Dict[str, dict]) -> None:
+    if conflicts:
+        first_norm = next(iter(conflicts))
+        info = conflicts[first_norm]
+        parts = ", ".join(sorted(conflicts.keys()))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Part {parts} is already in current order {info['order_no']}. "
+                f"A part can only be in one current order at a time — remove it "
+                f"from {info['order_no']} first, or add it there."
+            ),
+        )
+
+
 @api_router.get("/orders/check-part/{part_no}")
 async def check_part_history(
     part_no: str,
@@ -949,31 +1034,82 @@ async def check_part_history(
     exclude_order_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
 ):
-    """Warn only if this part was in the MOST RECENT previous order sheet (same system)."""
+    """Return two things for a part (same system):
+    1) current_order: if the part is already in ANOTHER current (draft) order ->
+       this add must be BLOCKED (a part can only live in one current sheet).
+    2) recent_sent: if the part was in a SENT order sent within the last 7 days
+       -> show a WARNING (not a block)."""
     require_system_access(current_user, system)
     norm = normalize_part_no(part_no)
-    query: dict = {"system": system, "items.part_no": {"$exists": True}}
+
+    # Mandatory parts are exempt from all restrictions/warnings — they may appear
+    # in every sheet.
+    mandatory = await _get_mandatory_norms(system)
+    if norm in mandatory:
+        return {
+            "part_no": part_no,
+            "is_mandatory": True,
+            "blocked": False,
+            "current_order": None,
+            "recent_sent": None,
+            "recent_sent_window_days": RECENT_SENT_WINDOW_DAYS,
+            "previously_ordered": False,
+            "orders": [],
+        }
+
+    # 1) Conflict with another current order (block)
+    conflicts = await _find_current_order_conflicts(system, {norm}, exclude_order_id)
+    current_order = conflicts.get(norm)
+
+    # 2) Recently-sent warning (within RECENT_SENT_WINDOW_DAYS)
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=RECENT_SENT_WINDOW_DAYS)
+    ).isoformat()
+    sent_query: dict = {
+        "system": system,
+        "status": "sent",
+        "sent_at": {"$gte": cutoff},
+    }
     if exclude_order_id:
-        query["id"] = {"$ne": exclude_order_id}
-    # Find only the most recent order (excluding the current one)
-    latest = await db.orders.find_one(
-        query,
-        {"_id": 0, "id": 1, "order_no": 1, "status": 1, "created_at": 1, "items": 1},
-        sort=[("created_at", -1)],
-    )
-    prev_orders = []
-    if latest:
-        for it in latest.get("items", []):
+        sent_query["id"] = {"$ne": exclude_order_id}
+    recent_sent = None
+    async for o in (
+        db.orders.find(
+            sent_query,
+            {"_id": 0, "id": 1, "order_no": 1, "sent_at": 1, "items": 1},
+        ).sort("sent_at", -1)
+    ):
+        for it in o.get("items", []):
             if normalize_part_no(it.get("part_no", "")) == norm:
-                prev_orders.append({
-                    "order_id": latest["id"],
-                    "order_no": latest["order_no"],
-                    "status": latest["status"],
-                    "created_at": latest["created_at"],
+                recent_sent = {
+                    "order_id": o["id"],
+                    "order_no": o["order_no"],
+                    "sent_at": o.get("sent_at"),
                     "qty": it.get("qty"),
-                })
+                }
                 break
-    return {"part_no": part_no, "previously_ordered": len(prev_orders) > 0, "orders": prev_orders}
+        if recent_sent:
+            break
+
+    # Legacy compatibility: previously_ordered / orders reflect the blocking case.
+    legacy_orders = []
+    if current_order:
+        legacy_orders.append({
+            "order_id": current_order["order_id"],
+            "order_no": current_order["order_no"],
+            "status": "current",
+        })
+
+    return {
+        "part_no": part_no,
+        "is_mandatory": False,
+        "blocked": current_order is not None,
+        "current_order": current_order,
+        "recent_sent": recent_sent,
+        "recent_sent_window_days": RECENT_SENT_WINDOW_DAYS,
+        "previously_ordered": len(legacy_orders) > 0,
+        "orders": legacy_orders,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1798,21 +1934,98 @@ async def export_database(current_user: dict = Depends(get_current_user)):
         docs = await db[name].find({}, {"_id": 0}).to_list(None)
         payload["collections"][name] = docs
 
-    body = _json.dumps(payload, indent=2, default=str).encode("utf-8")
+    # allow_nan=False guarantees strict, standards-compliant JSON (no bare NaN /
+    # Infinity tokens that browsers' JSON.parse would reject). default=_json_safe
+    # converts any stray float NaN/Inf and other non-serialisable values.
+    import math
+
+    def _json_safe(o):
+        if isinstance(o, float) and (math.isnan(o) or math.isinf(o)):
+            return None
+        return str(o)
+
+    # Pre-sanitise NaN/Inf floats anywhere in the payload so allow_nan=False
+    # never raises during serialisation.
+    def _sanitize(obj):
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_sanitize(v) for v in obj]
+        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+            return None
+        return obj
+
+    payload = _sanitize(payload)
+    body = _json.dumps(payload, indent=2, allow_nan=False, default=_json_safe).encode("utf-8")
     filename = f"hmcl-backup-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
-    return StreamingResponse(
-        io.BytesIO(body),
+    # Use a plain Response with an explicit Content-Length so proxies/clients can
+    # detect and reject a truncated download instead of silently saving a partial
+    # (invalid) file.
+    return Response(
+        content=body,
         media_type="application/json",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(body)),
+        },
     )
 
 
-def _parse_backup_payload(raw: bytes) -> dict:
-    import json as _json
+def _recover_truncated_json(text: str):
+    """Return (data, recovered). Tries a strict parse first; if that fails
+    (e.g. the backup download was truncated), salvage the longest valid prefix
+    by cutting at the last completed element and closing any still-open
+    brackets/braces. This lets a partially-downloaded backup still restore the
+    records that made it into the file."""
     try:
-        data = _json.loads(raw.decode("utf-8"))
+        return _json_module.loads(text), False
+    except Exception:
+        pass
+
+    stack = []
+    in_str = False
+    esc = False
+    cut_candidates = []  # (index_of_closing_char, stack_snapshot_after_close)
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+            cut_candidates.append((i, list(stack)))
+
+    for idx, snap in reversed(cut_candidates):
+        candidate = text[: idx + 1] + "".join(reversed(snap))
+        try:
+            return _json_module.loads(candidate), True
+        except Exception:
+            continue
+    return None, True
+
+
+def _parse_backup_payload(raw: bytes):
+    try:
+        text = raw.decode("utf-8")
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Invalid JSON file: {exc}")
+        raise HTTPException(status_code=400, detail=f"Could not read file: {exc}")
+
+    data, recovered = _recover_truncated_json(text)
+    if data is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON file — the backup could not be read or repaired.",
+        )
 
     if not isinstance(data, dict) or data.get("app") != "hero-parts-ordering":
         raise HTTPException(
@@ -1821,6 +2034,7 @@ def _parse_backup_payload(raw: bytes) -> dict:
         )
     if not isinstance(data.get("collections"), dict):
         raise HTTPException(status_code=400, detail="Missing 'collections' object in backup.")
+    data["_recovered"] = recovered
     return data
 
 
@@ -1871,6 +2085,7 @@ async def import_database(
         raise HTTPException(status_code=403, detail="Missing permission: backup_restore")
     raw = await file.read()
     data = _parse_backup_payload(raw)
+    recovered = bool(data.get("_recovered"))
     collections = data["collections"]
 
     imported: dict = {}
@@ -1883,11 +2098,20 @@ async def import_database(
 
     await _recreate_core_indexes()
 
+    note = "Sign out and sign in again if your credentials came from the imported file."
+    if recovered:
+        note = (
+            "NOTE: the backup file was incomplete/truncated, so it was auto-repaired "
+            "and the recoverable records were restored (some trailing records may be "
+            "missing — re-upload your inventory Excel if needed). " + note
+        )
+
     return {
         "success": True,
         "imported": imported,
+        "recovered": recovered,
         "exported_at": data.get("exported_at"),
-        "note": "Sign out and sign in again if your credentials came from the imported file.",
+        "note": note,
     }
 
 
