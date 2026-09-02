@@ -347,6 +347,16 @@ class AddItemsBody(BaseModel):
     items: List[OrderItem] = []
 
 
+class ReceiveItemBody(BaseModel):
+    part_no: str
+    received: bool = True
+    received_qty: Optional[int] = None
+
+
+class ReceiveBody(BaseModel):
+    items: List[ReceiveItemBody] = []
+
+
 class MandatoryToggleBody(BaseModel):
     enabled: bool
 
@@ -923,12 +933,161 @@ async def mark_sent(order_id: str, current_user: dict = Depends(require_fresh_in
         raise HTTPException(status_code=403, detail="Missing permission: orders_mark_sent")
     if not order.get("items"):
         raise HTTPException(status_code=400, detail="Cannot send an empty order")
+    # Snapshot current stock per item so "Mark Received" can detect deliveries later.
+    items = list(order.get("items", []))
+    stock_map = await _load_stock_map({normalize_part_no(i.get("part_no", "")) for i in items})
+    for it in items:
+        it["stock_at_sent"] = stock_map.get(normalize_part_no(it.get("part_no", "")), 0.0)
     await db.orders.update_one(
         {"id": order_id},
-        {"$set": {"status": "sent", "sent_at": now_iso(), "updated_at": now_iso()}},
+        {"$set": {"status": "sent", "items": items, "sent_at": now_iso(), "updated_at": now_iso()}},
     )
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
     return updated
+
+
+async def _load_stock_map(norms: set) -> Dict[str, float]:
+    norms.discard("")
+    out: Dict[str, float] = {}
+    if not norms:
+        return out
+    async for inv in db.inventory.find(
+        {"part_no_norm": {"$in": list(norms)}}, {"_id": 0, "part_no_norm": 1, "stock_qty": 1}
+    ):
+        out[inv["part_no_norm"]] = float(inv.get("stock_qty") or 0)
+    return out
+
+
+def _receipt_status(qty: int, received_qty: int) -> str:
+    if received_qty >= qty:
+        return "received"
+    if received_qty > 0:
+        return "partial"
+    return "not_received"
+
+
+async def _auto_receive_check(order: dict) -> List[dict]:
+    """Compare stock now vs stock when the order was sent to guess what arrived."""
+    items = order.get("items", []) or []
+    stock_map = await _load_stock_map({normalize_part_no(i.get("part_no", "")) for i in items})
+    rows: List[dict] = []
+    for it in items:
+        norm = normalize_part_no(it.get("part_no", ""))
+        qty = int(it.get("qty") or 0)
+        current = stock_map.get(norm, 0.0)
+        at_sent = it.get("stock_at_sent")
+        if at_sent is None:
+            # Legacy order sent before snapshots existed: simple stock check.
+            received_qty = qty if current >= qty else 0
+            method = "stock_level"
+        else:
+            received_qty = int(min(qty, max(0.0, current - float(at_sent))))
+            method = "snapshot"
+        rows.append({
+            "part_no": it.get("part_no", ""),
+            "description": it.get("description", ""),
+            "qty": qty,
+            "stock_at_sent": at_sent,
+            "current_stock": current,
+            "received_qty": received_qty,
+            "pending_qty": max(0, qty - received_qty),
+            "status": _receipt_status(qty, received_qty),
+            "method": method,
+        })
+    return rows
+
+
+async def _get_sent_order_for_receipt(order_id: str, current_user: dict) -> dict:
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    require_system_access(current_user, order.get("system", "hero"))
+    if order.get("status") != "sent":
+        raise HTTPException(status_code=400, detail="Only sent orders can be checked for receipt")
+    return order
+
+
+@api_router.get("/orders/{order_id}/receive-check")
+async def receive_check(order_id: str, current_user: dict = Depends(get_current_user)):
+    order = await _get_sent_order_for_receipt(order_id, current_user)
+    rows = await _auto_receive_check(order)
+    return {
+        "order_id": order_id,
+        "order_no": order.get("order_no"),
+        "items": rows,
+        "has_snapshot": any(r["method"] == "snapshot" for r in rows),
+        "existing_receipt": order.get("receipt"),
+    }
+
+
+@api_router.post("/orders/{order_id}/mark-received")
+async def mark_received(order_id: str, body: ReceiveBody, current_user: dict = Depends(get_current_user)):
+    order = await _get_sent_order_for_receipt(order_id, current_user)
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("orders_mark_sent"):
+        raise HTTPException(status_code=403, detail="Missing permission: orders_mark_sent")
+
+    overrides = {normalize_part_no(i.part_no): i for i in body.items}
+    rows = await _auto_receive_check(order)
+    for r in rows:
+        ov = overrides.get(normalize_part_no(r["part_no"]))
+        if ov is None:
+            continue
+        if not ov.received:
+            received_qty = 0
+        elif ov.received_qty is not None:
+            received_qty = max(0, min(r["qty"], int(ov.received_qty)))
+        else:
+            received_qty = r["qty"]
+        r["received_qty"] = received_qty
+        r["pending_qty"] = max(0, r["qty"] - received_qty)
+        r["status"] = _receipt_status(r["qty"], received_qty)
+        r["method"] = "manual"
+
+    receipt = {
+        "received_at": now_iso(),
+        "received_by": current_user["username"],
+        "items": rows,
+        "received_count": sum(1 for r in rows if r["status"] == "received"),
+        "partial_count": sum(1 for r in rows if r["status"] == "partial"),
+        "pending_count": sum(1 for r in rows if r["status"] != "received"),
+    }
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {"receipt": receipt, "received_at": receipt["received_at"], "updated_at": now_iso()}},
+    )
+    return await db.orders.find_one({"id": order_id}, {"_id": 0})
+
+
+@api_router.post("/orders/{order_id}/clear-receipt")
+async def clear_receipt(order_id: str, current_user: dict = Depends(get_current_user)):
+    order = await _get_sent_order_for_receipt(order_id, current_user)
+    if not is_owner(current_user) and not current_user.get("permissions", {}).get("orders_mark_sent"):
+        raise HTTPException(status_code=403, detail="Missing permission: orders_mark_sent")
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$unset": {"receipt": "", "received_at": ""}, "$set": {"updated_at": now_iso()}},
+    )
+    return await db.orders.find_one({"id": order_id}, {"_id": 0})
+
+
+def _pending_reorder_doc(order: dict) -> dict:
+    """Build an order-shaped dict containing only the not-yet-received quantities."""
+    receipt = order.get("receipt") or {}
+    pending = [r for r in receipt.get("items", []) if r.get("pending_qty", 0) > 0]
+    if not pending:
+        raise HTTPException(status_code=400, detail="No pending items — everything was received")
+    by_norm = {normalize_part_no(i.get("part_no", "")): i for i in order.get("items", [])}
+    items = []
+    for r in pending:
+        src = by_norm.get(normalize_part_no(r["part_no"]), {})
+        items.append({**src, "part_no": r["part_no"], "description": r.get("description", ""), "qty": int(r["pending_qty"])})
+    return {
+        **order,
+        "order_no": f"{order['order_no']}-PENDING",
+        "status": "pending reorder",
+        "items": items,
+        "remarks": f"Items not received from {order['order_no']} (checked {receipt.get('received_at', '')[:10]})",
+    }
 
 
 @api_router.post("/orders/{order_id}/reopen")
@@ -941,7 +1100,10 @@ async def reopen_order(order_id: str, current_user: dict = Depends(get_current_u
         raise HTTPException(status_code=403, detail="Missing permission: orders_mark_sent")
     await db.orders.update_one(
         {"id": order_id},
-        {"$set": {"status": "current", "sent_at": None, "updated_at": now_iso()}},
+        {
+            "$set": {"status": "current", "sent_at": None, "updated_at": now_iso()},
+            "$unset": {"receipt": "", "received_at": ""},
+        },
     )
     updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
     return updated
@@ -1377,6 +1539,33 @@ async def export_pdf(order_id: str, current_user: dict = Depends(get_current_use
         io.BytesIO(content),
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@api_router.get("/orders/{order_id}/export-pending/{kind}")
+async def export_pending(order_id: str, kind: str, current_user: dict = Depends(get_current_user)):
+    """Excel/PDF of items NOT received (per the saved receipt) so they can be reordered."""
+    if kind not in ("excel", "pdf"):
+        raise HTTPException(status_code=404, detail="Unknown export kind")
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    require_system_access(current_user, order.get("system", "hero"))
+    if not order.get("receipt"):
+        raise HTTPException(status_code=400, detail="Order has not been marked as received yet")
+    doc = _pending_reorder_doc(order)
+    if kind == "excel":
+        content, media, ext = (
+            build_order_excel(doc),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xlsx",
+        )
+    else:
+        content, media, ext = build_order_pdf(doc), "application/pdf", "pdf"
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=media,
+        headers={"Content-Disposition": f"attachment; filename={doc['order_no']}.{ext}"},
     )
 
 

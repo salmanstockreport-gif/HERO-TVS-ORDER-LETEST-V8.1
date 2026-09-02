@@ -122,6 +122,16 @@ export default function OrdersList({ status }) {
                       >
                         {o.status}
                       </span>
+                      {o.receipt && (
+                        <span
+                          className={`badge ml-2 ${o.receipt.pending_count ? "badge-stock-low" : "badge-stock-ok"}`}
+                          data-testid={`receipt-badge-${o.order_no}`}
+                        >
+                          {o.receipt.pending_count
+                            ? `${o.receipt.pending_count} pending`
+                            : "Received"}
+                        </span>
+                      )}
                     </td>
                     <td className="num">{(o.items || []).length}</td>
                     <td className="num">₹{total.toFixed(2)}</td>

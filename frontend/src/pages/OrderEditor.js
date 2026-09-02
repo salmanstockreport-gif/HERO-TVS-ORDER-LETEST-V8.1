@@ -12,12 +12,15 @@ import {
   ArrowCounterClockwise,
   ClipboardText,
   Package,
+  CheckCircle,
 } from "@phosphor-icons/react";
 import { toast } from "sonner";
 import api, { API, formatApiError } from "@/lib/api";
 import { IDS } from "@/lib/testIds";
 import { formatPartNo, formatPartNoForSystem, partNoKey } from "@/lib/partNo";
 import ConfirmDeleteDialog from "@/components/ConfirmDeleteDialog";
+import ReceiveOrderDialog, { receiptBadge } from "@/components/ReceiveOrderDialog";
+import ReceiptSummary from "@/components/ReceiptSummary";
 import { useSystem } from "@/context/SystemContext";
 
 const emptyItem = () => ({
@@ -58,6 +61,7 @@ export default function OrderEditor() {
   const [inventoryMap, setInventoryMap] = useState({}); // part_no_norm -> stock
   const [manualOpen, setManualOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [receiveOpen, setReceiveOpen] = useState(false);
   const [manualForm, setManualForm] = useState({
     part_no: "",
     description: "",
@@ -465,10 +469,22 @@ export default function OrderEditor() {
     toast.success("Order reopened");
   };
 
-  const downloadFile = async (kind) => {
+  const clearReceipt = async () => {
+    if (!order) return;
+    if (!window.confirm("Clear the receipt for this order?")) return;
+    try {
+      const { data } = await api.post(`/orders/${order.id}/clear-receipt`);
+      setOrder(data);
+      toast.success("Receipt cleared");
+    } catch (e) {
+      toast.error(formatApiError(e.response?.data?.detail) || e.message);
+    }
+  };
+
+  const downloadFile = async (kind, pending = false) => {
     if (!order) return;
     const token = localStorage.getItem("hmc_token");
-    const url = `${API}/orders/${order.id}/export/${kind}`;
+    const url = `${API}/orders/${order.id}/${pending ? "export-pending" : "export"}/${kind}`;
     try {
       const resp = await fetch(url, {
         headers: { Authorization: `Bearer ${token}` },
@@ -477,7 +493,7 @@ export default function OrderEditor() {
       const blob = await resp.blob();
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
-      link.download = `${order.order_no}.${kind === "excel" ? "xlsx" : "pdf"}`;
+      link.download = `${order.order_no}${pending ? "-PENDING" : ""}.${kind === "excel" ? "xlsx" : "pdf"}`;
       link.click();
       URL.revokeObjectURL(link.href);
     } catch {
@@ -614,6 +630,16 @@ export default function OrderEditor() {
             >
               {order.status}
             </span>
+            {order.receipt && (
+              <span
+                className={`badge ${order.receipt.pending_count ? "badge-stock-low" : "badge-stock-ok"}`}
+                data-testid="editor-receipt-badge"
+              >
+                {order.receipt.pending_count
+                  ? `Received · ${order.receipt.pending_count} pending`
+                  : "Received"}
+              </span>
+            )}
             <span
               className="badge"
               style={{
@@ -680,14 +706,24 @@ export default function OrderEditor() {
               <span>Mark Sent</span>
             </button>
           ) : (
-            <button
-              data-testid={IDS.editorReopenBtn}
-              onClick={reopen}
-              className="btn btn-primary"
-            >
-              <ArrowCounterClockwise size={14} weight="bold" />
-              <span>Reopen</span>
-            </button>
+            <>
+              <button
+                data-testid="editor-mark-received-btn"
+                onClick={() => setReceiveOpen(true)}
+                className="btn btn-primary"
+              >
+                <CheckCircle size={14} weight="bold" />
+                <span>{order.receipt ? "Re-check Receipt" : "Mark Received"}</span>
+              </button>
+              <button
+                data-testid={IDS.editorReopenBtn}
+                onClick={reopen}
+                className="btn btn-outline"
+              >
+                <ArrowCounterClockwise size={14} weight="bold" />
+                <span>Reopen</span>
+              </button>
+            </>
           )}
           <button
             data-testid={IDS.editorDeleteBtn}
@@ -698,6 +734,16 @@ export default function OrderEditor() {
           </button>
         </div>
       </div>
+
+      {/* Receipt summary (sent orders that were checked for delivery) */}
+      {readonly && order.receipt && (
+        <ReceiptSummary
+          receipt={order.receipt}
+          onDownload={downloadFile}
+          onRecheck={() => setReceiveOpen(true)}
+          onClear={clearReceipt}
+        />
+      )}
 
       {/* Search bar */}
       {!readonly && (
@@ -1125,12 +1171,16 @@ export default function OrderEditor() {
                   <th className="num">Qty</th>
                   <th className="num">Line Total</th>
                   <th className="center">Stock</th>
+                  {readonly && order.receipt && <th className="center">Receipt</th>}
                   {!readonly && <th></th>}
                 </tr>
               </thead>
               <tbody>
                 {items.map((it, idx) => {
                   const stock = partNoLookupStock(it.part_no);
+                  const rec = order.receipt?.items?.find(
+                    (r) => partNoKey(r.part_no) === partNoKey(it.part_no),
+                  );
                   let stockBadge = null;
                   if (stock === undefined) stockBadge = null;
                   else if (stock <= 0)
@@ -1229,6 +1279,16 @@ export default function OrderEditor() {
                         ₹{Number(it.line_total).toFixed(2)}
                       </td>
                       <td className="center">{stockBadge}</td>
+                      {readonly && order.receipt && (
+                        <td className="center" data-testid={`order-item-receipt-${idx}`}>
+                          {rec ? receiptBadge(rec.status) : null}
+                          {rec?.status === "partial" && (
+                            <div className="text-xs mt-1" style={{ color: "var(--hero-muted)" }}>
+                              {rec.received_qty}/{rec.qty}
+                            </div>
+                          )}
+                        </td>
+                      )}
                       {!readonly && (
                         <td className="center">
                           <button
@@ -1271,6 +1331,17 @@ export default function OrderEditor() {
         onConfirm={deleteOrder}
         testIdPrefix="editor-confirm-delete"
       />
+
+      {receiveOpen && order && (
+        <ReceiveOrderDialog
+          order={order}
+          onClose={() => setReceiveOpen(false)}
+          onDone={(updated) => {
+            setReceiveOpen(false);
+            setOrder(updated);
+          }}
+        />
+      )}
     </div>
   );
 }
